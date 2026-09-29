@@ -20,6 +20,7 @@ const {
 } = require("../src/tools/ventasPorCondicionPago");
 const { backlogPrevendedores, inputSchema: inputSchemaBacklogPrevendedores } = require("../src/tools/backlogPrevendedores");
 const { inputSchema: inputSchemaVentasRutaOk, RUTAS_OK_VALIDAS } = require("../src/tools/ventasRutaOk");
+const { inputSchema: inputSchemaFacturasProveedores, COMPANIAS_VALIDAS } = require("../src/tools/facturasProveedores");
 const { pool } = require("../src/db");
 
 async function main() {
@@ -411,6 +412,39 @@ async function main() {
   });
   if (!parseoVentasRutaOkArray.success) throw new Error("FALLO: zod rechazó el array de rutas OK válidas (113/131/132) en ventasRutaOk");
   console.log("OK: ventasRutaOk acepta el array de las 3 rutas OK válidas.");
+
+  // 17) facturasProveedores (nuevo): no toca Postgres en absoluto (todo va
+  //     a Odoo vía JSON-RPC) — no hay `pool.query` que proteger acá. `compania`
+  //     es z.enum(...) igual que ventasRutaOk: un payload de inyección se
+  //     rechaza directo por no ser uno de los 5 alias válidos, sin necesidad
+  //     de probar el bypass a nivel de query (`compania` solo indexa un
+  //     objeto de configuración fijo en JS — COMPANIAS — nunca se concatena
+  //     ni se pasa a la llamada JSON-RPC).
+  const schemaFacturasProveedores = z.object(inputSchemaFacturasProveedores);
+  const parseoFacturasProveedoresInyeccion = schemaFacturasProveedores.safeParse({
+    compania: payload,
+    fecha_inicio: "2026-01-01",
+    fecha_fin: "2026-01-31",
+  });
+  if (parseoFacturasProveedoresInyeccion.success) throw new Error("FALLO: zod aceptó un payload de inyección en `compania` de facturasProveedores");
+  console.log("OK: zod rechazó el payload de inyección en `compania` de facturasProveedores ->", parseoFacturasProveedoresInyeccion.error.issues[0].message);
+
+  const parseoFacturasProveedoresArray = schemaFacturasProveedores.safeParse({
+    compania: COMPANIAS_VALIDAS,
+    fecha_inicio: "2026-01-01",
+    fecha_fin: "2026-01-31",
+  });
+  if (!parseoFacturasProveedoresArray.success) throw new Error("FALLO: zod rechazó el array de las 5 compañías válidas en facturasProveedores");
+  console.log("OK: facturasProveedores acepta el array de las 5 compañías válidas.");
+
+  const parseoFacturasProveedoresTipoInyeccion = schemaFacturasProveedores.safeParse({
+    compania: "COTTSA",
+    fecha_inicio: "2026-01-01",
+    fecha_fin: "2026-01-31",
+    tipo_documento: "FACTURA'; DROP TABLE clientes; --",
+  });
+  if (parseoFacturasProveedoresTipoInyeccion.success) throw new Error("FALLO: zod aceptó un payload de inyección en `tipo_documento` de facturasProveedores");
+  console.log("OK: zod rechazó el payload de inyección en `tipo_documento` de facturasProveedores ->", parseoFacturasProveedoresTipoInyeccion.error.issues[0].message);
 
   await pool.end();
   console.log("\nSEGURIDAD SMOKE TEST OK");
