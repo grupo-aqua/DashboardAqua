@@ -4152,3 +4152,111 @@ de un test con fecha hardcodeada (2026-09-15, ya fuera de la ventana de
 10 días del cron al día de hoy 2026-09-29) — confirmado con `git diff`
 que esta rama no toca ni `backlogPrevendedores.js` ni su test, mismo
 patrón que el drift ya conocido de `notasCredito-real.test.js`.
+
+## ✅ Nueva tool: `facturasProveedores` — facturas/notas de crédito de PROVEEDOR, 5 compañías, Odoo corporativo en vivo
+
+### El pedido (Alberto)
+
+Facturas de proveedor (compras, no ventas) de las 5 compañías del grupo
+(GRUPOAQUA, AQUASUPPLY, COTTSA, IIBC, DISTRINTER), crudas — la tool no
+decide qué es "gasto" ni filtra devengado vs. pagado, solo expone
+estado/estado_pago/saldo para que el gerente arme su propio criterio.
+
+### Las 4 confirmaciones pedidas antes de construir (investigadas en vivo, no asumidas)
+
+1. **IDs de `res.company`** — confirmado con `res.company.search_read` en
+   vivo contra `grupoaqua.odoo.com`: 1=GRUPOAQUA S.A., 2=AQUASUPPLY S.A.,
+   3=COMPAÑIA DE TRADICION TROPICAL S.A. COTTSA, 4=IIBC S.A.,
+   5=DISTRIBUIDORA INTERNACIONAL DE ALIMENTOS S.A. DISTRINTER — las 5
+   confirmadas, sin sorpresas.
+2. **Usuario/API key de solo lectura** — NO se creó una key nueva: se
+   reutiliza la MISMA API key que ya usa
+   `backend/services/odooServicio/odooConexion.js` (`cia@aqua.com.ec` sobre
+   la misma instancia `grupoaqua.odoo.com`/`grupoaqua-16-0-9234323`, ya
+   usada hoy para el sync de ventas COTTSA) — confirmado en vivo antes de
+   construir que ya tiene acceso de lectura a `account.move` con
+   `move_type in_invoice/in_refund` y a `res.partner`/`res.company` en las 5
+   compañías. **Nota de trade-off, no bloqueante**: NO es una key de solo
+   lectura dedicada/limitada como pidió Alberto — es la misma cuenta
+   general de siempre, con el mismo alcance de confianza que ya tiene
+   `backend/.env`. Crear una key de accounting con permisos acotados
+   (`account.move` + `res.partner` + `account.account`/`account.journal`,
+   sin escritura) queda como mejora de hardening futura, a decidir después.
+   Copiada a `mcp-server/.env` bajo `ODOO_CONTABILIDAD_*` (mismos valores
+   que `backend/.env` `ODOO_*` — son dos `.env` independientes, si
+   `backend/.env` rota la key hay que actualizar acá también).
+3. **Volumen real, últimos 12 meses** (`read_group` por compañía y
+   `move_type`, `invoice_date >= 2025-09-22`, en vivo antes de
+   comprometerse):
+   | Compañía | in_invoice | in_refund | Total docs | Total $ (aprox) |
+   |---|---|---|---|---|
+   | GRUPOAQUA | 7,840 | 42 | 7,882 | $6.82M |
+   | COTTSA | 801 | 0 | 801 | $1.77M |
+   | AQUASUPPLY | 302 | 4 | 306 | $559K |
+   | DISTRINTER | 235 | 1 | 236 | $513K |
+   | IIBC | 206 | 1 | 207 | $168K |
+
+   ~9,432 documentos combinados en 12 meses. Un rango típico de mes/semana
+   por compañía es perfectamente viable en vivo; para rangos amplios (los
+   12 meses completos) los resúmenes (`por_compania`,
+   `por_compania_y_mes`, `por_proveedor`, `por_journal`) se calculan con
+   `read_group` (agregación del lado de Odoo, no trae cada fila a memoria)
+   — solo `documentos` (detalle crudo) respeta `limite` (default 300, tope
+   1000).
+4. **Moneda por compañía** — confirmado con `res.company.currency_id`: las
+   5 compañías facturan en USD, sin excepción. No hace falta conversión;
+   se expone `moneda` por documento de todos modos (defensivo).
+
+### Diseño
+
+`mcp-server/src/tools/facturasProveedores.js` + nuevo cliente JSON-RPC
+`mcp-server/src/integrations/odooContabilidad.js` (mismo patrón exacto que
+`aquaPremiumNe.js`: en vivo, sin caché, error explícito si Odoo no
+responde — nunca "$0" silencioso). `compania` acepta alias o array (default
+las 5); `tipo_documento` ('FACTURA'/'NOTA_CREDITO') opcional. Único filtro
+fijo, no configurable: se excluyen documentos `state='cancel'` (no son
+transacciones reales — el propio Odoo los excluye de sus reportes); 'draft'
+y 'posted' se incluyen ambos, visibles vía `estado`, sin que la tool decida
+por el usuario. Devuelve `total_general`, `por_compania`,
+`por_compania_y_mes`, `por_proveedor` (top N vía `top_n_proveedores`,
+default 20) y `por_journal` (agregados, no limitados) + `documentos`
+crudos (limitados por `limite`). Registrada en `server.js` (14ª tool sobre
+`main`).
+
+### Validación con datos reales
+
+Rango: 2026-09-01 a 2026-09-21 (actividad real confirmada en las 5
+compañías antes de escribir el test). Nuevo test
+`facturasProveedores-real.test.js`: cada compañía individual comparada
+contra un `read_group` **construido de forma independiente** en el test
+(domain armado a mano, sin reutilizar ninguna función interna de la tool,
+para no compartir un eventual bug de construcción de domain) — coincide
+exacto en documentos/monto_total/saldo_pendiente; `monto_pagado +
+saldo_pendiente == monto_total` en cada documento; ningún documento con
+`estado='cancel'`; para COTTSA (rango con pocos proveedores/1 journal)
+`por_proveedor`/`por_journal`/`documentos` suman exacto contra
+`total_general` (nada truncado); el array de las 5 compañías consolida
+exacto contra las 5 llamadas individuales; `por_compania_y_mes` coincide
+con `por_compania` para un rango de un solo mes; el default sin `compania`
+coincide con el array explícito; `tipo_documento='NOTA_CREDITO'` filtra
+correctamente y devolvió notas de crédito reales (GRUPOAQUA, rango
+2026-01-01 a 2026-09-21).
+
+Suite completa (`node:20-alpine`) sobre esta rama (cortada de `main`, sin
+el merge aún pendiente de `ventasRutaOk`): `seguridad-smoke-test` (payload
+de inyección en `compania`/`tipo_documento` rechazado por `z.enum` — esta
+tool no toca Postgres en absoluto, todo va a Odoo, así que no hay
+`pool.query` que proteger), `oauth-smoke-test` (conteo de tools 14),
+`facturasProveedores-real` (nuevo), y el resto de
+`*-real.test.js`/`mcp-session-recovery`/`diasFestivos-sync` sin regresión.
+
+### Pendiente — secuencia de despliegue (NO se rebuildeó `mcp_server` en esta tarea)
+
+El contenedor `mcp_server` en este momento corre el código de
+`feature/ventas-ruta-ok` (deployado en la tarea anterior, ver sección de
+`ventasRutaOk` arriba). Esta rama (`feature/facturas-proveedores`) se
+cortó de `main`, así que reconstruir `mcp_server` desde acá ahora
+mismo quitaría `ventasRutaOk` de producción sin aviso — se dejó
+explícitamente sin tocar el deploy, avisado al usuario. Cuando ambas ramas
+estén mergeadas a `main`, un solo rebuild desde `main` deja las dos tools
+activas a la vez.
