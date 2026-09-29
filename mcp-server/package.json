@@ -14,6 +14,7 @@
     "test:condicion-pago-real": "node test/ventasPorCondicionPago-real.test.js",
     "test:notas-credito-real": "node test/notasCredito-real.test.js",
     "test:backlog-prevendedores-real": "node test/backlogPrevendedores-real.test.js",
+    "test:clasificacion-ruta-combinada-real": "node test/clasificacionRutaCombinada-real.test.js",
     "test:mcp-session-recovery": "node test/mcp-session-recovery.test.js"
   },
   "dependencies": {
