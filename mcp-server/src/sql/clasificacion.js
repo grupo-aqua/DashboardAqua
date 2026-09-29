@@ -17,6 +17,24 @@
 // input de usuario) — el ruta/grupo/fechas que sí vienen del usuario siempre
 // se pasan como parámetros $1, $2, ... en cada tool, nunca concatenados aquí.
 
+// CORRECCIÓN 2026-09-29 (bug real reportado por el usuario, encontrado
+// durante el trabajo de automatización del cuadro de liquidación): las
+// rutas "OK" (113/131/132/132.1 — manejadas de forma completa y aparte en
+// ventasRutaOk.js, que combina COTTSA + aqua-premium-ne) tienen
+// `seller_code` = 'RUTA 113'/'RUTA 131'/'RUTA 132'/'RUTA 132.1' —
+// empiezan con 'R' de "RUTA", así que el patrón `ILIKE 'R%'` de abajo
+// (pensado para rutas rurales genuinas R1-R6/R1.2) las clasificaba sin
+// querer como RURAL. Confirmado con datos reales: rutas rurales genuinas
+// suman ~$289K, mientras que estas 4 rutas mal clasificadas ahí suman
+// ~$2.72M — es decir, ~90% de lo que salía bajo grupo=RURAL antes de este
+// fix en realidad no era rural. Decisión explícita de Alberto: grupo
+// PROPIO ('RUTA_COMBINADA'), no excluirlas del todo — quedan visibles en
+// las tools de grupo igual que los demás grupos, separadas de RURAL. Para
+// el desglose completo (incluyendo aqua-premium-ne) seguir usando
+// ventasRutaOk.js — este grupo acá solo refleja lo que ya está en
+// `ordenes`/`facturas` (COTTSA), igual que cualquier otro grupo.
+const SELLER_CODES_RUTA_COMBINADA_SQL = "('RUTA 113', 'RUTA 131', 'RUTA 132', 'RUTA 132.1')";
+
 // Usado en la rama de `ordenes` (alias o). Los callers de esta rama SIEMPRE
 // filtran `o.origen_sistema = 'MOBILVENDOR'` en su propio WHERE (ver
 // ventasPorGrupo.js/resumenDiario.js/topProductos.js/clientesPorGrupo.js) —
@@ -28,8 +46,13 @@
 // Empresas), pero nunca se clasificaban (quedaban excluidas por
 // FILTRO_ORDENES_GRUPO_VALIDO). Ver hallazgo completo en TODO.md
 // ("bug real: grupo='EMPRESAS' en facturas matchea el equipo equivocado").
+// NOTA: `ordenes` nunca ha tenido filas reales con estos seller_code
+// (COTTSA solo los registra en `facturas`, confirmado con datos reales al
+// construir ventasRutaOk.js) — la rama de 'RUTA_COMBINADA' se agrega igual
+// acá por completitud/defensivo, no porque haya un caso real hoy.
 const CASE_GRUPO_ORDENES = `
   CASE
+    WHEN o.seller_code IN ${SELLER_CODES_RUTA_COMBINADA_SQL} THEN 'RUTA_COMBINADA'
     WHEN o.seller_code ILIKE 'M%'  THEN 'MAYORISTA'
     WHEN o.seller_code ILIKE 'TV%' THEN 'TIENDAS_VIP'
     WHEN o.seller_code ILIKE 'T%'  AND o.seller_code NOT ILIKE 'TV%' THEN 'TIENDAS'
@@ -42,7 +65,8 @@ const CASE_GRUPO_ORDENES = `
 // Solo estos seller_code de `ordenes` tienen grupo conocido (ver comentario arriba).
 const FILTRO_ORDENES_GRUPO_VALIDO = `
   (
-    o.seller_code ILIKE 'M%'
+    o.seller_code IN ${SELLER_CODES_RUTA_COMBINADA_SQL}
+    OR o.seller_code ILIKE 'M%'
     OR o.seller_code ILIKE 'TV%'
     OR (o.seller_code ILIKE 'T%' AND o.seller_code NOT ILIKE 'TV%')
     OR o.seller_code ILIKE 'R%'
@@ -91,6 +115,7 @@ const CASE_GRUPO_FACTURAS = `
   CASE
     WHEN f.seller_code IN ('A1','A2','A3','A4.1','A5','A6','A7','TA2') THEN 'DOMICILIO'
     WHEN f.equipo_ventas_nombre = 'Domicilio' THEN 'DOMICILIO'
+    WHEN f.seller_code IN ${SELLER_CODES_RUTA_COMBINADA_SQL} THEN 'RUTA_COMBINADA'
     WHEN f.seller_code ILIKE 'M%' THEN 'MAYORISTA'
     WHEN f.equipo_ventas_nombre = 'Empresas' THEN 'EMPRESAS'
     WHEN f.origen_sistema = 'MOBILVENDOR' AND f.seller_code ILIKE 'E%' THEN 'EMPRESAS'
@@ -118,6 +143,7 @@ const GRUPOS_VALIDOS = [
   "TIENDAS_VIP",
   "TIENDAS",
   "RURAL",
+  "RUTA_COMBINADA",
   "TELEVENTA_VIP",
   "DOMICILIO",
   "EMPRESAS",
