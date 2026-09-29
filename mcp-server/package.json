@@ -14,7 +14,8 @@
     "test:condicion-pago-real": "node test/ventasPorCondicionPago-real.test.js",
     "test:notas-credito-real": "node test/notasCredito-real.test.js",
     "test:backlog-prevendedores-real": "node test/backlogPrevendedores-real.test.js",
-    "test:mcp-session-recovery": "node test/mcp-session-recovery.test.js"
+    "test:mcp-session-recovery": "node test/mcp-session-recovery.test.js",
+    "test:ventas-ruta-ok-real": "node test/ventasRutaOk-real.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",

@@ -3876,3 +3876,112 @@ Suite completa (`node:20-alpine`) 7/7 OK (`seguridad-smoke-test`,
 `mcp-session-recovery` nuevo) + `diasFestivos-sync` desde host —
 `notasCredito-real.test.js` no se corrió, deriva de datos preexistente ya
 reportada aparte, sin relación a este fix.
+
+## ✅ Nueva tool: `ventasRutaOk` — combinado COTTSA + aqua-premium-ne de las rutas "OK" (113/131/132), sin deduplicar todavía
+
+### El pedido (gerencia, vía Alberto)
+
+Rutas "OK" (113, 131, 132) venden en dos sistemas Odoo distintos:
+COTTSA (ya sincronizado en `ventas_mv`, factura formalmente al SRI) y una
+segunda instancia separada, **aqua-premium-ne**
+(`https://aqua-premium-ne.odoo.com`), donde las mismas rutas registran
+ventas que NO se facturan formalmente ahí (quedan como `pos.order` — Punto
+de Venta, notas de entrega, no `sale.order`: ese módulo no está instalado
+en esa instancia). El gerente quiere ver el total vendido de OK = suma de
+ambas fuentes, con opción de desglosar por facturado (COTTSA) vs. no
+facturado (aqua-premium-ne).
+
+### Investigación previa (antes de construir nada, pedido explícito)
+
+- **Conexión**: JSON-RPC (`common.authenticate` + `object.execute_kw`,
+  endpoint `POST /jsonrpc`) — funciona igual que XML-RPC en Odoo Online
+  aunque no sea plan enterprise; se prefirió JSON-RPC para no agregar una
+  dependencia nueva (Node ya trae `fetch`). Odoo devuelve HTTP 200 incluso
+  en errores de auth/permisos — el error real va en un campo `.error` del
+  body, hay que chequearlo explícito (no solo el status HTTP). Cliente
+  nuevo: `mcp-server/src/integrations/aquaPremiumNe.js` — llamada EN VIVO
+  sin caché, con propagación explícita de errores de red/timeout/auth
+  (nunca "$0" silencioso si la instancia no responde).
+- **"Ruta" en aqua-premium-ne** = el Punto de Venta (`pos.config.name`):
+  "RUTA 113" (`config_id` 23), "RUTA 131" (25), "RUTA 132.1" (24 — NO existe
+  un "RUTA 132" puro ahí, solo el ".1"). En COTTSA (`facturas.seller_code`)
+  SÍ existen 'RUTA 132' y 'RUTA 132.1' como códigos separados — la tool
+  combina ambos bajo `ruta="132"`.
+- **Mismo esquema de numeración que COTTSA** — confirmado cruzando 14
+  clientes reales de aqua-premium-ne por RUC (`res.partner.vat`) contra
+  `clientes.identificacion_cliente`: los 14 ya existen en `ventas_mv`,
+  varios con `codigo_usuario_asignado_cliente` literal "113"/"131"/"132.1".
+  No hace falta tabla de mapeo de rutas.
+- **`ordenes` no tiene nada de estas rutas** — solo `facturas` (COTTSA
+  factura, nunca genera orden MobilVendor bajo estos `seller_code`),
+  confirmado con datos reales antes de escribir el SQL.
+- **⚠️ Riesgo de doble conteo detectado (investigado, NO resuelto — decisión
+  de Alberto abajo)**: COTTSA YA factura activamente bajo `seller_code`
+  'RUTA 113' (4,447 facturas/$1,104,568.60 a la fecha), 'RUTA 131'
+  (3,382/$817,666.17), 'RUTA 132' (1,270/$503,479.82) y 'RUTA 132.1'
+  (1,119/$252,364.99) — volumen comparable o mayor al de aqua-premium-ne.
+  Caso concreto encontrado: cliente BELTRAN CORDERO REYNA MARITZA con una
+  orden aqua-premium-ne de $1,350.00 (RUTA 113, 2026-06-02) y una factura
+  COTTSA de $1,349.99 (RUTA 132, 2026-06-30) — mismo cliente, monto casi
+  idéntico, ~4 semanas de diferencia. No se investigó el rastro técnico del
+  "liquidador" (qué proceso mueve una venta de aqua-premium-ne a una
+  factura COTTSA, si es que pasa) — decisión explícita de Alberto: publicar
+  primero los números crudos de cada sistema para que él los verifique
+  manualmente contra ambos sistemas, ANTES de construir cualquier
+  deduplicación. Esa investigación queda para una fase de limpieza
+  posterior, solo si Alberto la pide después de ver los números reales.
+- **Hallazgo importante de frescura de datos**: aqua-premium-ne NO tiene
+  ninguna actividad para estas 3 rutas después del **2026-06-09**
+  (confirmado con `search_read` ordenado `date_order desc` sobre los 3
+  `config_id` — más de 3 meses de antigüedad respecto a "hoy", 2026-09-22).
+  Esto afecta directamente el caso de uso principal de Alberto ("mes
+  actual"/"mes anterior"): esa fuente da $0 ahí, no porque la tool falle
+  sino porque el sistema realmente dejó de tener datos. Se expone
+  explícito en la respuesta (`advertencia_aqua_premium_ne`) para que no se
+  lea como "no hubo ventas OK".
+
+### Diseño implementado (alcance de esta fase — instrucción explícita de Alberto)
+
+`mcp-server/src/tools/ventasRutaOk.js`: totales **crudos** de cada sistema
+en un rango de fechas, **sin filtrar ni deduplicar** entre las dos fuentes
+todavía. `ruta` acepta '113'/'131'/'132' (o array; default las 3
+combinadas). Devuelve `total_combinado`, `por_fuente` (`cottsa` vs.
+`aqua_premium_ne`) y `por_cliente` (consolidado por RUC entre ambas
+fuentes — mismo criterio de "duplicados de maestro" que el resto de la
+familia de tools). aqua-premium-ne se consulta EN VIVO en cada llamada, sin
+sincronización propia ni tabla nueva en `ventas_mv` — construir eso sería
+prematuro antes de que Alberto valide que el enfoque combinado tiene
+sentido; documentado como decisión explícita y temporal en el código.
+
+Registrada en `server.js` (14ª tool). Bug encontrado y corregido antes de
+entregar: la función JS aceptaba `ruta` sin default propio (solo el
+`.default()` de zod, que no aplica cuando se llama la función directo,
+p.ej. desde los tests) — causaba `TypeError` al pedir el combinado sin
+especificar `ruta`; se agregó el default (`RUTAS_OK_VALIDAS`) directo en la
+firma de la función.
+
+### Validación con datos reales
+
+Rango elegido a propósito: **mayo 2026** (mes cerrado, con actividad real
+confirmada en las 3 rutas en AMBAS fuentes — usar el mes actual aquí
+hubiera dado $0 de aqua-premium-ne y no habría probado nada). Nuevo test
+`ventasRutaOk-real.test.js`: cada ruta individual comparada contra SQL
+directo (COTTSA) y JSON-RPC directo (aqua-premium-ne, `read_group` sin
+agrupar) — coincide exacto en dólares y documentos; `total_combinado` =
+suma exacta de ambas fuentes; `por_cliente` suma exacto al
+`total_combinado`; el array de las 3 rutas consolida exacto contra las 3
+llamadas individuales; el default sin `ruta` coincide con el array
+explícito; para un rango de septiembre 2026 (mes actual) SÍ aparece
+`advertencia_aqua_premium_ne` y esa fuente da $0/0 documentos como se
+esperaba (confirma la razón de la advertencia, no un bug).
+
+Suite completa (`node:20-alpine`) OK: `seguridad-smoke-test` (payload de
+inyección en `ruta` rechazado por `z.enum` — más estricto que el patrón
+regex de las demás tools, porque `ruta` solo indexa un objeto de
+configuración fijo en JS, nunca llega a SQL), `oauth-smoke-test` (conteo de
+tools actualizado a 14), `ventasRutaOk-real` (nuevo), y el resto de
+`*-real.test.js`/`mcp-session-recovery`/`diasFestivos-sync` sin regresión
+— `notasCredito-real.test.js` sigue fallando por el mismo drift de datos
+preexistente ya reportado (línea base "CD COMISARIATO", no relacionado a
+esta tool). Confirmado desplegado en el contenedor `mcp_server` en vivo
+(`grep` dentro del contenedor).

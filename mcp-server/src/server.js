@@ -31,6 +31,7 @@ const { clientesSinVisita, inputSchema: schemaClientesSinVisita } = require("./t
 const { clientesVisitadosSinVenta, inputSchema: schemaClientesVisitadosSinVenta } = require("./tools/clientesVisitadosSinVenta");
 const { ventasPorCondicionPago, inputSchema: schemaVentasPorCondicionPago } = require("./tools/ventasPorCondicionPago");
 const { backlogPrevendedores, inputSchema: schemaBacklogPrevendedores } = require("./tools/backlogPrevendedores");
+const { ventasRutaOk, inputSchema: schemaVentasRutaOk } = require("./tools/ventasRutaOk");
 
 function resultadoTexto(objeto) {
   return { content: [{ type: "text", text: JSON.stringify(objeto, null, 2) }] };
@@ -167,6 +168,16 @@ function crearServer() {
       inputSchema: schemaBacklogPrevendedores,
     },
     async (args) => resultadoTexto(await backlogPrevendedores(args))
+  );
+
+  server.registerTool(
+    "ventasRutaOk",
+    {
+      description:
+        "Ventas combinadas de las rutas 'OK' (113, 131, 132 — 132 incluye 'RUTA 132' y 'RUTA 132.1' de COTTSA) en un rango de fechas: total_combinado + desglose por_cliente (identificado por RUC, consolidando ambas fuentes) + por_fuente (COTTSA facturado vs. aqua-premium-ne no facturado). FASE ACTUAL (instrucción explícita de Alberto, no cambiar sin confirmar con él): son los totales CRUDOS de cada sistema, sin ningún intento de deduplicar entre las dos fuentes — existe un riesgo de doble conteo detectado y documentado en TODO.md (COTTSA ya factura bajo estos mismos seller_code) que Alberto va a verificar manualmente antes de pedir una fase de limpieza. aqua-premium-ne (la fuente no facturada) se consulta EN VIVO a un Odoo externo en cada llamada — si no responde, la tool falla explícitamente en vez de mostrar $0. IMPORTANTE: aqua-premium-ne no tiene ninguna venta registrada para estas 3 rutas después del 2026-06-09 (confirmado, no es un bug) — la respuesta trae advertencia_aqua_premium_ne cuando el rango pedido cae después de esa fecha, para no leer un $0 de esa fuente como 'no hubo ventas OK'. ruta acepta un código ('113'/'131'/'132') o un array de varios; por defecto (sin especificar) trae las 3 combinadas con desglose por_ruta.",
+      inputSchema: schemaVentasRutaOk,
+    },
+    async (args) => resultadoTexto(await ventasRutaOk(args))
   );
 
   return server;
