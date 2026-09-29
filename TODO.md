@@ -4204,6 +4204,8 @@ nuevos `args`. NO se redesplegó `mcp_server` en producción con este
 cambio — es una mejora de observabilidad, no urgente (pedido explícito del
 usuario), pendiente de aplicarse la próxima vez que se reconstruya el
 contenedor real (o antes, si se pide).
+
+
 ## ✅ Nueva tool: `ventasRutaOk` — combinado COTTSA + aqua-premium-ne de las rutas "OK" (113/131/132), sin deduplicar todavía
 
 ### El pedido (gerencia, vía Alberto)
@@ -4587,3 +4589,144 @@ de un test con fecha hardcodeada (2026-09-15, ya fuera de la ventana de
 10 días del cron al día de hoy 2026-09-29) — confirmado con `git diff`
 que esta rama no toca ni `backlogPrevendedores.js` ni su test, mismo
 patrón que el drift ya conocido de `notasCredito-real.test.js`.
+
+## ✅ Bug 2: fallback de `metodo_pago_cliente` vía Odoo (resuelto de raíz, no solo documentado)
+
+### El pedido (usuario, 2026-09-29, mismo mensaje que Bug 1 de arriba)
+
+Ya se había investigado (ver sección "Investigación aparte" arriba, dentro
+de `ventasPorRutaCondicion`) que el 17% de los clientes DOMICILIO sin
+`metodo_pago_cliente` vienen de Odoo/Website y nunca pasan por
+MobilVendor — estructuralmente ese campo nunca se llena para ellos.
+Pedido explícito: no dejarlo solo documentado, construir un fallback real
+que cruce por RUC contra Odoo (`property_payment_term_id` →
+`invoice_payment_term_id`, mismo patrón de cruce por RUC que
+`auditoriaClientes.js`), solo lectura, sin escribir nada en la base.
+
+### Investigación de campo Odoo (antes de construir)
+
+`res.partner.property_payment_term_id` (Many2one "Customer Payment
+Terms", ej. `[13, "Pago Inmediato"]` / `[4, "30 días"]`) es el equivalente
+real de `metodo_pago_cliente` en Odoo — mismo criterio de clasificación
+que ya usa `CONDICION_PAGO_CLIENTE` (`ILIKE 'pago inmediato'` → CONTADO,
+cualquier otro valor no vacío → CREDITO). Cuando el partner no tiene ese
+campo poblado, se usa como 2do nivel `account.move.invoice_payment_term_id`
+de la factura `out_invoice` más reciente del cliente en Odoo. Con una
+muestra de 20 RUC reales SIN_DATO probada en vivo antes de construir:
+11/20 (55%) resolvían con esta combinación — suficiente para justificar
+construirlo (no se descartó por baja cobertura).
+
+### Qué se construyó
+
+- **`mcp-server/src/integrations/odooCondicionPagoFallback.js`** (nuevo) —
+  `resolverCondicionPagoOdoo(rucs)`: dado un array de RUC, dedupea, busca
+  `res.partner` por `vat IN rucs` (con `property_payment_term_id`), y para
+  los que no resuelven ahí, busca su `account.move` `out_invoice` más
+  reciente con `invoice_payment_term_id` poblado. Devuelve un `Map` de
+  `ruc -> { condicion_pago, fuente: 'PARTNER'|'FACTURA' } | null`. SOLO
+  LECTURA (ningún `write`/`create` a Odoo ni a Postgres). Diseñado para
+  degradar con gracia (a diferencia de `aquaPremiumNe.js` en
+  `ventasRutaOk`, que es una fuente primaria y por eso sí lanza duro si
+  falla) — es un enriquecimiento sobre un número SIN_DATO que ya era
+  correcto sin el fallback, nunca debe romper una respuesta válida.
+- **`ventasPorCondicionPago.js`** — nuevas queries
+  `SQL_SIN_DATO_CLIENTES`/`SQL_PREVENTA_SIN_DATO_CLIENTES` (mismo WHERE
+  base que `SQL`/`SQL_PREVENTA`, reutilizan tal cual
+  `CONDICION_PAGO_CLIENTE`/`CONDICION_PAGO_FACTURA` — nunca reescriben la
+  clasificación), agrupadas por cliente (`customer_code`, `ruc`,
+  `fuente_condicion`) y filtradas a `condicion_pago='SIN_DATO'`. Nueva
+  función `aplicarFallbackOdoo()`: mueve lo resuelto de `SIN_DATO` a
+  `CONTADO`/`CREDITO` con `fuente_condicion='ODOO_FALLBACK'` (nueva
+  etiqueta, mismo principio de trazabilidad que
+  `TRANSACCIONAL`/`METODO_PAGO_CLIENTE`/`NOTA_CREDITO`). La respuesta
+  ahora trae `fallback_odoo: { intentados, resueltos, dolares_resueltos,
+  error }`.
+- **`ventasPorRutaCondicion.js`** — mismo mecanismo, 4 queries mirror
+  (`SQL_GRUPO_SIN_DATO_CLIENTES`, `SQL_GRUPO_PREVENTA_SIN_DATO_CLIENTES`,
+  `SQL_RUTA_SIN_DATO_CLIENTES`, `SQL_RUTA_PREVENTA_SIN_DATO_CLIENTES`) y
+  `aplicarFallbackOdooPorRuta()`, que mueve dólares de
+  `dolares_sin_dato`/`num_documentos_sin_dato` a
+  `dolares_contado`/`dolares_credito` EN LA FILA DE SU RUTA. **Decisión de
+  alcance importante**: estas queries filtran explícitamente
+  `fuente_condicion != 'NOTA_CREDITO'` — porque `agregarPorRuta()` YA
+  segrega cualquier fila con `fuente_condicion='NOTA_CREDITO'` a su propio
+  bucket `dolares_nota_credito` (sin importar su `condicion_pago`), así
+  que un SIN_DATO+NOTA_CREDITO nunca cae en `dolares_sin_dato` en esta
+  tool — no hay nada que arreglar ahí, sería doble trabajo y rompería el
+  bucket `dolares_nota_credito` ya establecido. Confirmado con datos
+  reales (EMPRESAS): `ventasPorCondicionPago` sí resuelve un SIN_DATO de
+  origen NOTA_CREDITO (queda plegado en `dolares_nota_credito`, ya
+  correcto), mientras que `ventasPorRutaCondicion` reporta 0 intentados
+  para el mismo grupo/rango — comportamiento esperado, no una
+  discrepancia entre tools.
+- Ambas tools añaden `fallback_odoo` a su respuesta — nunca cambian
+  `dolares_totales` (es una reclasificación de dólares ya contados, no
+  dólares nuevos).
+
+### Bug encontrado y corregido DURANTE la construcción (antes de dar por buena la tool)
+
+Primera versión de `aplicarFallbackOdoo()` restaba del bucket
+`SIN_DATO|METODO_PAGO_CLIENTE` usando como llave la constante JS
+`FUENTE_CONDICION_PAGO_CLIENTE` — pero esa constante es un **literal SQL**
+(`"'METODO_PAGO_CLIENTE'"`, con comillas embebidas, para usarse dentro de
+un `SELECT ... AS fuente_condicion`), no el valor pelado que realmente
+vuelve en la columna. La llave nunca coincidía, así que el bucket
+`SIN_DATO` de `por_condicion` (agregado) bajaba a 0 correctamente pero el
+desglose `por_condicion_y_fuente` seguía mostrando el monto SIN_DATO
+original sin restar — **la resta silenciosamente no pasaba**, detectado
+al validar con datos reales (DOMICILIO, ~$170K resueltos: el bucket
+agregado daba $0 pero el desglose por fuente seguía en el monto
+original). Corregido usando el valor literal `"METODO_PAGO_CLIENTE"` (y,
+en la iteración siguiente, el `fuente_condicion` real de cada fila de
+`SQL_SIN_DATO_CLIENTES`, para cubrir también el caso NOTA_CREDITO —ver
+arriba). Validado de nuevo tras el fix: el desglose por fuente ahora sí
+queda en $0 para lo resuelto.
+
+### Validación con datos reales
+
+Rango cerrado 2026-01-01 a 2026-08-31 (meses completos, evita comparar
+dos queries secuenciales contra datos que siguen cambiando en vivo — con
+`fecha_fin=hoy` se detectó una diferencia de pocos dólares entre
+`ventasPorCondicionPago` y `ventasPorGrupo` simplemente por una orden
+nueva entrando entre una consulta y la otra, no un bug):
+
+- **DOMICILIO**: 146 clientes SIN_DATO con RUC, **146 resueltos (100%)**
+  vía Odoo, $521,446.15 reclasificados de SIN_DATO a CONTADO/CREDITO.
+  `dolares_totales` idéntico antes/después ($836,703.00).
+- **EMPRESAS**: 15 clientes SIN_DATO con RUC (todos de origen
+  NOTA_CREDITO), 15 resueltos (100%), -$1,054.65 netos (créditos).
+- **VIP**: 0 SIN_DATO en este rango — el fallback no intenta nada
+  (degradación correcta cuando no hay candidatos, sin llamar a Odoo).
+- La tasa de resolución real (100% sobre clientes que SÍ transaccionaron
+  en el rango) es más alta que la estimada en la investigación previa
+  (~61% sobre el censo completo de 158 clientes DOMICILIO SIN_DATO,
+  incluyera o no ventas recientes) — consistente: el universo
+  transaccional está sesgado hacia clientes activos, más probables de
+  tener cuenta/facturas recientes en Odoo también.
+- `ventasPorRutaCondicion` en modo ruta y grupo: `por_ruta` sigue sumando
+  exacto a `dolares_totales`, ninguna ruta queda con `dolares_sin_dato`
+  negativo.
+- Test nuevo: `mcp-server/test/fallbackOdooCondicionPago-real.test.js`
+  (`npm run test:fallback-odoo-condicion-real`) — cubre las 4 invariantes
+  de arriba para DOMICILIO/EMPRESAS/VIP en ambas tools.
+
+### Validación técnica (suite completa, `node:20-alpine`)
+
+`seguridad-smoke-test` OK (sin cambios de superficie — estas 2 tools ya
+estaban cubiertas), `oauth-smoke-test` OK (conteo de tools 16, sin
+cambios — esta tarea solo mejora 2 tools existentes, no registra
+ninguna nueva), `ventasPorCondicionPago-real` OK (sin regresión, todos
+los totales siguen cuadrando contra `ventasPorGrupo`),
+`ventasPorRutaCondicion-real` OK (sin regresión), y el nuevo
+`fallback-odoo-condicion-real` OK.
+
+### Fuera de alcance, decisión explícita
+
+No se corrigió la causa raíz en el sync de Odoo (capturar el payment
+method del checkout web hacia `metodo_pago_cliente` en
+`sincronizacionOdooService.js`) — el pedido fue explícitamente "cruzar por
+RUC y traer el dato de Odoo" como fallback de consulta, no tocar el sync.
+Sigue sin resolverse ~0% (en este rango) o hasta ~39% (según la
+investigación de censo completo) de los SIN_DATO que tampoco tienen RUC
+usable o no resuelven ni siquiera vía Odoo — esos genuinamente no tienen
+fuente de verdad en ningún sistema hoy.
