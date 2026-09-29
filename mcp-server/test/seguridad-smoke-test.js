@@ -20,6 +20,7 @@ const {
 } = require("../src/tools/ventasPorCondicionPago");
 const { backlogPrevendedores, inputSchema: inputSchemaBacklogPrevendedores } = require("../src/tools/backlogPrevendedores");
 const { inputSchema: inputSchemaVentasRutaOk, RUTAS_OK_VALIDAS } = require("../src/tools/ventasRutaOk");
+const { ventasPorRutaCondicion, inputSchema: inputSchemaVentasPorRutaCondicion } = require("../src/tools/ventasPorRutaCondicion");
 const { pool } = require("../src/db");
 
 async function main() {
@@ -411,6 +412,57 @@ async function main() {
   });
   if (!parseoVentasRutaOkArray.success) throw new Error("FALLO: zod rechazó el array de rutas OK válidas (113/131/132) en ventasRutaOk");
   console.log("OK: ventasRutaOk acepta el array de las 3 rutas OK válidas.");
+
+  // 17) ventasPorRutaCondicion (nuevo): `ruta` es texto libre (mismo patrón
+  //     que ventasPorRuta) — un payload de inyección debe rechazarse por
+  //     la regex de zod antes de tocar la query.
+  const schemaVentasPorRutaCondicion = z.object(inputSchemaVentasPorRutaCondicion);
+  const parseoVPRCInyeccion = schemaVentasPorRutaCondicion.safeParse({
+    ruta: payload,
+    fecha_inicio: "2026-01-01",
+    fecha_fin: "2026-01-31",
+  });
+  if (parseoVPRCInyeccion.success) throw new Error("FALLO: zod aceptó un payload de inyección en `ruta` de ventasPorRutaCondicion");
+  console.log("OK: zod rechazó el payload de inyección en `ruta` de ventasPorRutaCondicion ->", parseoVPRCInyeccion.error.issues[0].message);
+
+  // Aunque alguien se salte zod y llame la función interna directo con el
+  // payload como `ruta` (bypaseando la regex), pg debe seguir tratándolo
+  // como texto literal ($1::text[] posicional) — no debe lanzar error de
+  // sintaxis ni afectar la tabla.
+  const resultadoVPRCInyeccion = await ventasPorRutaCondicion({
+    ruta: payload,
+    fecha_inicio: "2026-01-01",
+    fecha_fin: "2026-01-31",
+  });
+  console.log(
+    "OK: ventasPorRutaCondicion con ruta maliciosa no lanzó error de sintaxis ->",
+    JSON.stringify({ dolares_totales: resultadoVPRCInyeccion.dolares_totales })
+  );
+
+  const { rows: rowsOrdenes3 } = await pool.query("SELECT to_regclass('ordenes') AS existe");
+  if (!rowsOrdenes3[0].existe) throw new Error("FALLO: la tabla ordenes ya no existe (inyección exitosa vía ventasPorRutaCondicion)");
+  console.log("OK: la tabla `ordenes` sigue existiendo intacta (payload vía ventasPorRutaCondicion).");
+
+  // `ruta` y `grupo` son excluyentes — ambos o ninguno debe fallar antes de
+  // tocar la base (validación propia de la función, no de zod, ya que zod
+  // no puede expresar "exactamente uno de dos campos opcionales").
+  let fallóAmbos = false;
+  try {
+    await ventasPorRutaCondicion({ ruta: "T5", grupo: "TIENDAS", fecha_inicio: "2026-01-01", fecha_fin: "2026-01-31" });
+  } catch {
+    fallóAmbos = true;
+  }
+  if (!fallóAmbos) throw new Error("FALLO: ventasPorRutaCondicion aceptó `ruta` y `grupo` juntos, deberían ser excluyentes");
+  console.log("OK: ventasPorRutaCondicion rechaza pedir `ruta` y `grupo` juntos.");
+
+  let fallóNinguno = false;
+  try {
+    await ventasPorRutaCondicion({ fecha_inicio: "2026-01-01", fecha_fin: "2026-01-31" });
+  } catch {
+    fallóNinguno = true;
+  }
+  if (!fallóNinguno) throw new Error("FALLO: ventasPorRutaCondicion aceptó no pedir ni `ruta` ni `grupo`");
+  console.log("OK: ventasPorRutaCondicion rechaza no pedir ni `ruta` ni `grupo`.");
 
   await pool.end();
   console.log("\nSEGURIDAD SMOKE TEST OK");

@@ -3985,3 +3985,170 @@ tools actualizado a 14), `ventasRutaOk-real` (nuevo), y el resto de
 preexistente ya reportado (línea base "CD COMISARIATO", no relacionado a
 esta tool). Confirmado desplegado en el contenedor `mcp_server` en vivo
 (`grep` dentro del contenedor).
+
+## ✅ Nueva tool: `ventasPorRutaCondicion` — ventas por ruta desglosadas por condición de pago
+
+### El pedido
+
+Cruce que faltaba entre `ventasPorRuta`/`ventasPorGrupo` (desglose por
+ruta) y `ventasPorCondicionPago` (desglose CONTADO/CREDITO): una tool que
+desglose ventas por ruta Y por condición de pago a la vez, reutilizando
+EXACTAMENTE la misma lógica de clasificación que `ventasPorCondicionPago`
+(no reinventarla) para que las 2 tools nunca se desalineen.
+
+### Diseño
+
+Acepta exactamente uno de `ruta` (string o array de hasta 50, mismo patrón
+que `ventasPorRuta` — filtra por `seller_code` directo, SIN
+`FILTRO_CLIENTE_VALIDO`, mismo comportamiento ya existente ahí) o `grupo`
+(mismo patrón que `ventasPorGrupo` — clasifica por `CASE_GRUPO_*` +
+`FILTRO_CLIENTE_VALIDO`) — nunca ambos ni ninguno, cada modo tiene un WHERE
+de base distinto y no había ningún caso de uso que combinara los dos.
+`categoria` opcional. Importa `CONDICION_PAGO_CLIENTE`/
+`CONDICION_PAGO_FACTURA`/`FUENTE_CONDICION_PAGO_*` tal cual de
+`clasificacion.js`, sin copiar/reescribir la lógica.
+
+Cada fila de `por_ruta` trae `dolares_contado`/`dolares_credito`/
+`dolares_sin_dato`/`dolares_nota_credito` (+ su `num_documentos_*`
+correspondiente) — `dolares_sin_dato`/`num_documentos_sin_dato`/
+`num_documentos_nota_credito` son campos agregados MÁS ALLÁ del schema
+literal pedido, justificados por el propio requisito #3 del pedido ("no
+forzar SIN_DATO a CREDITO", "`dolares_totales` debe cuadrar sin importar
+el desglose"): sin un bucket `SIN_DATO` explícito,
+`dolares_contado+dolares_credito+dolares_nota_credito` quedaría MENOR que
+`dolares_totales` en cualquier ruta con `metodo_pago_cliente` sin poblar
+(ej. DOMICILIO) sin ninguna explicación visible — mismo principio de
+transparencia que ya usa `por_condicion_y_fuente` en
+`ventasPorCondicionPago.js`.
+
+### Hallazgo real encontrado al construir (no antes) — colisión en la clasificación RURAL existente
+
+`CASE_GRUPO_FACTURAS`/`CASE_GRUPO_ORDENES` clasifican como RURAL cualquier
+`seller_code` que empiece con 'R' — eso incluye, sin querer, 'RUTA 113' /
+'RUTA 131' / 'RUTA 132' / 'RUTA 132.1' (los `seller_code` COTTSA de las
+rutas "OK" de `ventasRutaOk.js`), porque también empiezan con 'R' de
+"RUTA". Confirmado con datos reales:
+
+```
+R1        1,662 docs   $22,785.72
+R1.2         39 docs    $1,919.24
+R2        1,583 docs   $32,430.18
+R3        3,773 docs   $66,313.65
+R4        2,476 docs   $83,574.86
+R5        2,597 docs   $59,397.01
+R6          303 docs   $22,761.58
+RUTA 113  4,513 docs $1,125,256.28
+RUTA 131  3,400 docs   $822,455.41
+RUTA 132  1,309 docs   $518,092.65
+RUTA 132.1 1,119 docs   $252,364.99
+```
+
+Rutas rurales genuinas (R1-R6, R1.2): ~$289K combinado. Rutas "OK"
+mezcladas ahí por la colisión de prefijo: ~$2.72M — es decir, **hoy,
+pedir `grupo=RURAL` en `ventasPorGrupo`/`ventasPorCondicionPago` da un
+número donde ~90% en realidad son ventas de rutas OK, no rural real**.
+
+Esta tool REUTILIZA `CASE_GRUPO_FACTURAS`/`CASE_GRUPO_ORDENES` tal cual
+(mismo principio de "no reinventar" que aplica a la condición de pago) —
+**no se corrige acá**, sería una decisión de negocio unilateral sin pedido
+explícito. Reportado para que Alberto decida si vale la pena separar el
+patrón `'R%'` genuino de las `'RUTA %'` de `ventasRutaOk` en una tarea
+propia — probablemente tan simple como agregar `AND seller_code NOT ILIKE
+'RUTA %'` a la rama RURAL del CASE, pero es una decisión de negocio (¿esas
+4 rutas deberían contarse en algún grupo? ¿en ninguno?), no técnica.
+
+### aqua-premium-ne (requisito #2) — mismo manejo especial que `ventasRutaOk`
+
+Solo aplica en modo `ruta` (nunca en modo `grupo`, aunque `grupo=RURAL`
+arrastre esas 4 rutas por la colisión de arriba — mezclar una consulta en
+vivo a un sistema externo dentro de un desglose por GRUPO, sin que el
+usuario haya pedido esas rutas explícitamente, sería sorprendente). Cuando
+`ruta` incluye exactamente `'RUTA 113'`/`'RUTA 131'`/`'RUTA 132'` (NO
+`'RUTA 132.1'` — comparte el mismo `config_id` de aqua-premium-ne que
+`'RUTA 132'`, ver `RUTAS_OK` en `ventasRutaOk.js`; sumarlo a ambas si se
+piden las dos por separado duplicaría el dato), se consulta en vivo
+`pos.order` de aqua-premium-ne para ese `config_id` y se suma al bucket
+CONTADO de esa fila.
+
+Confirmado con datos reales que esto es correcto: se consultó
+`pos.payment` del histórico completo de las 3 rutas en aqua-premium-ne —
+9,045 pagos "Cash 01" ($1,408,946.64) + 494 pagos "Cash" ($141,937.00), **0
+métodos de crédito** — 100% contado por diseño (POS, se cobra al
+momento). No se suma a `unidades_totales` (aqua-premium-ne no expone
+unidades por línea sin una consulta adicional más pesada — mismo alcance
+que ya tiene `ventasRutaOk.js`, que tampoco reporta unidades de esta
+fuente).
+
+### Validación con los 3 casos reales dados
+
+1. **EMPRESAS 2026-09-04**: `dolares_totales` = $12,274.53 (exacto),
+   contado real = $8.24, ubicado en ruta E4 (exacto).
+2. **VIP 2026-09-04**: `dolares_totales` = $9,812.93 (exacto), contado
+   real = $458.66 (exacto). El desglose por ruta específico mencionado en
+   el pedido original (V1/V2/V3/V5/V6) no coincidió con el resultado — se
+   verificó con SQL independiente (armado desde cero, sin reutilizar
+   ningún código de la tool) que el desglose real es **V6 ($305.68) / H10
+   ($91.08) / V2 ($40.50) / V1 ($21.40)**, sin V3 ni V5 — el total
+   coincide exacto en ambos casos, así que la lista de rutas del pedido
+   era de memoria aproximada, no una cifra verificada; se validó el total
+   + que la suma por ruta cuadre exacto, no la lista específica.
+3. **DOMICILIO A1 2026-09-02**: `dolares_totales` = $256.85 en modo
+   `ruta` (vs. ~$256.88 esperado, diferencia de 3 centavos — coincide
+   EXACTO con lo que ya da `ventasPorRuta({ruta:'A1',...})`, de donde
+   salió la cifra de referencia). **Nota de transparencia (no es un bug de
+   esta tool)**: en modo `grupo=DOMICILIO`, A1 da $226.86 en vez de
+   $256.85 — la diferencia son $29.99 de un solo cliente con
+   `customer_code='8'` (código genérico) que `ventasPorGrupo`/
+   `ventasPorCondicionPago` excluyen vía `FILTRO_CLIENTE_VALIDO` en su
+   rama DOMICILIO, pero que `ventasPorRuta` nunca excluyó (no aplica ese
+   filtro en absoluto). Esta tool reproduce fielmente el comportamiento de
+   CADA tool existente en su modo correspondiente — la inconsistencia ya
+   existía entre `ventasPorRuta` y `ventasPorGrupo`/`ventasPorCondicionPago`,
+   esta tool solo la hace visible al ofrecer ambos modos lado a lado.
+
+### Investigación aparte (pedida en el mismo mensaje, no es parte de esta tool): ¿por qué `metodo_pago_cliente` no está poblado para la mayoría de clientes de DOMICILIO?
+
+Root cause confirmado con el código real, no solo con los datos:
+`metodo_pago_cliente` **nunca se escribe en el flujo de sync de Odoo**
+(`backend/services/odooServicio/sincronizacionOdooService.js` — 0
+apariciones del campo en todo el archivo) — solo lo escribe el flujo de
+MobilVendor (`sincronizacionService.js`, `syncCliente()`, desde
+`doc.payment_method_description`). Y `equipo_ventas` (el campo que
+identifica un pedido como DOMICILIO/"Website") viene de **Odoo**
+(`team_id` de `sale.order`/`account.move`, confirmado en
+`sincronizacionOdooService.js` líneas 475-477/703-728) — es decir,
+**los clientes de DOMICILIO son clientes Odoo (equipo de ventas
+"Website"), nunca pasan por el sync de MobilVendor, así que
+`metodo_pago_cliente` se queda NULL permanentemente para ellos** — no es
+un hueco de sync accidental, es que ese campo estructuralmente no existe
+en el flujo que crea esos clientes. Confirmado con una muestra real:
+clientes SIN_DATO de DOMICILIO tienen `codigo_tipo_negocio`,
+`codigo_subcanal` y `mobilvendor_id_cliente` en blanco — nunca tocados
+por MobilVendor, con `fecha_creacion_cliente` del mismo día que su
+primer pedido web.
+
+Con datos de agosto-septiembre 2026: de los clientes con al menos un
+pedido DOMICILIO, 1,039 de 6,067 (17%) están SIN_DATO. No es la mayoría
+absoluta como se sospechaba, pero sí una porción real y con una causa
+estructural clara — arreglarlo requeriría o bien capturar el payment
+method del checkout web hacia `metodo_pago_cliente`, o bien agregar un
+criterio de condición de pago propio para pedidos Odoo/Website (similar a
+como `CONDICION_PAGO_FACTURA` ya usa una señal transaccional para
+`facturas` en vez de depender solo del fallback de cliente) — decisión de
+negocio/alcance, no se toca en esta tarea.
+
+### Validación técnica
+
+Suite completa (`node:20-alpine`): `seguridad-smoke-test` (payload de
+inyección en `ruta` rechazado por la misma regex que `ventasPorRuta`;
+confirmado que `ruta`/`grupo` son excluyentes — ambos o ninguno lanza
+error antes de tocar la base), `oauth-smoke-test` (conteo de tools 15),
+`ventasPorRutaCondicion-real` (nuevo — valida los 3 casos reales dados
++ cruces exactos contra `ventasPorRuta`/`ventasPorCondicionPago`, el
+hallazgo de RURAL, y que una ruta sin ventas en el rango aparezca en $0 en
+vez de ausente), y el resto de `*-real.test.js`/`mcp-session-recovery`
+sin regresión — `backlogPrevendedores-real.test.js` falló por date-drift
+de un test con fecha hardcodeada (2026-09-15, ya fuera de la ventana de
+10 días del cron al día de hoy 2026-09-29) — confirmado con `git diff`
+que esta rama no toca ni `backlogPrevendedores.js` ni su test, mismo
+patrón que el drift ya conocido de `notasCredito-real.test.js`.
