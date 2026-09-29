@@ -284,6 +284,7 @@ const metaHistoricaBotellon = async () => {
           WHEN o.seller_code ILIKE 'M%'  THEN 'MAYORISTA'
           WHEN o.seller_code ILIKE 'TV%' THEN 'TIENDAS_VIP'
           WHEN o.seller_code ILIKE 'T%'  AND o.seller_code NOT ILIKE 'TV%' THEN 'TIENDAS'
+          WHEN o.seller_code IN ('RUTA 113', 'RUTA 131', 'RUTA 132', 'RUTA 132.1') THEN 'RUTA_COMBINADA'
           WHEN o.seller_code ILIKE 'R%'  THEN 'RURAL'
           WHEN o.seller_code = '148399'  THEN 'TELEVENTA_VIP'
         END AS grupo,
@@ -314,6 +315,7 @@ const metaHistoricaBotellon = async () => {
           WHEN f.seller_code ILIKE 'M%'  THEN 'MAYORISTA'
           WHEN f.route_code  ILIKE 'A%'  THEN 'DOMICILIO'
           WHEN f.seller_code ILIKE 'E%'  THEN 'EMPRESAS'
+          WHEN f.seller_code IN ('RUTA 113', 'RUTA 131', 'RUTA 132', 'RUTA 132.1') THEN 'RUTA_COMBINADA'
           WHEN f.seller_code ILIKE 'R%'  THEN 'RURAL'
           WHEN f.seller_code ILIKE 'TV%' THEN 'TIENDAS_VIP'
           WHEN f.seller_code ILIKE 'T%'  AND f.seller_code NOT ILIKE 'TV%' THEN 'TIENDAS'
@@ -411,6 +413,7 @@ FROM (
       WHEN o.seller_code ILIKE 'M%'  THEN 'MAYORISTA'
       WHEN o.seller_code ILIKE 'TV%' THEN 'TIENDAS_VIP'
       WHEN o.seller_code ILIKE 'T%'  AND o.seller_code NOT ILIKE 'TV%' THEN 'TIENDAS'
+      WHEN o.seller_code IN ('RUTA 113', 'RUTA 131', 'RUTA 132', 'RUTA 132.1') THEN 'RUTA_COMBINADA'
       WHEN o.seller_code ILIKE 'R%'  THEN 'RURAL'
       WHEN o.seller_code = '148399'  THEN 'TELEVENTA_VIP'
     END AS grupo,
@@ -445,6 +448,7 @@ FROM (
         THEN 'DOMICILIO'
       WHEN f.seller_code ILIKE 'M%' THEN 'MAYORISTA'
       WHEN f.seller_code ILIKE 'E%' THEN 'EMPRESAS'
+      WHEN f.seller_code IN ('RUTA 113', 'RUTA 131', 'RUTA 132', 'RUTA 132.1') THEN 'RUTA_COMBINADA'
       WHEN f.seller_code ILIKE 'R%' THEN 'RURAL'
       WHEN f.seller_code ILIKE 'TV%' THEN 'TIENDAS_VIP'
       WHEN f.seller_code ILIKE 'T%' AND f.seller_code NOT ILIKE 'TV%' THEN 'TIENDAS'
@@ -537,6 +541,7 @@ ORDER BY codigo;
           WHEN o.seller_code ILIKE 'M%'  THEN 'MAYORISTA'
           WHEN o.seller_code ILIKE 'TV%' THEN 'TIENDAS_VIP'
           WHEN o.seller_code ILIKE 'T%'  AND o.seller_code NOT ILIKE 'TV%' THEN 'TIENDAS'
+          WHEN o.seller_code IN ('RUTA 113', 'RUTA 131', 'RUTA 132', 'RUTA 132.1') THEN 'RUTA_COMBINADA'
           WHEN o.seller_code ILIKE 'R%'  THEN 'RURAL'
           WHEN o.seller_code = '148399'  THEN 'TELEVENTA_VIP'
         END AS grupo,
@@ -570,6 +575,7 @@ ORDER BY codigo;
           WHEN f.seller_code ILIKE 'M%'  THEN 'MAYORISTA'
           WHEN f.route_code  ILIKE 'A%'  THEN 'DOMICILIO'
           WHEN f.seller_code ILIKE 'E%'  THEN 'EMPRESAS'
+          WHEN f.seller_code IN ('RUTA 113', 'RUTA 131', 'RUTA 132', 'RUTA 132.1') THEN 'RUTA_COMBINADA'
           WHEN f.seller_code ILIKE 'R%'  THEN 'RURAL'
           WHEN f.seller_code ILIKE 'TV%' THEN 'TIENDAS_VIP'
           WHEN f.seller_code ILIKE 'T%'  AND f.seller_code NOT ILIKE 'TV%' THEN 'TIENDAS'

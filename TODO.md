@@ -4044,6 +4044,132 @@ Suite completa (`node:20-alpine`) 7/7 OK (`seguridad-smoke-test`,
 `notasCredito-real.test.js` no se corrió, deriva de datos preexistente ya
 reportada aparte, sin relación a este fix.
 
+## 🐛 Fix: rutas "OK" (113/131/132/132.1) mal clasificadas como RURAL — nuevo grupo `RUTA_COMBINADA`
+
+### El reporte (Alberto, encontrado en el trabajo de automatización del cuadro de liquidación)
+
+`o.seller_code`/`f.seller_code` para las rutas "OK" empieza con "RUTA "
+— que también empieza con 'R', el mismo prefijo usado en TODO el
+codebase para clasificar rutas rurales genuinas (R1-R6, R1.2). Sin
+querer, cualquier `ILIKE 'R%'` pensado para RURAL también capturaba
+estas 4 rutas.
+
+### Dónde vivía la lógica (5 ubicaciones, no 1)
+
+1. `mcp-server/src/sql/clasificacion.js` (`CASE_GRUPO_ORDENES`/
+   `CASE_GRUPO_FACTURAS`) — afecta **10 tools de mcp-server**:
+   `ventasPorGrupo`, `ventasPorCondicionPago`, `ventasPorRutaCondicion`,
+   `resumenDiario`, `topProductos`, `clientesSinVisita`,
+   `clientesSinConsumo`, `clientesVisitadosSinVenta`, `clientesPorGrupo`,
+   y `proyeccionMensual` (indirecta, vía `ventasPorGrupo`).
+2. `backend/controllers/controllerConsolidado/consolidadoController.js`
+   (`qBotellonesOrdenes`, card "BOTELLONES" del Dashboard Consolidado
+   General).
+3. `backend/controllers/controllerBotellones/botellonesController.js` —
+   **6 ocurrencias** del mismo patrón CASE (3 pares ordenes+facturas, en
+   `metaHistoricaBotellon`, `obtenerGrupoBotellon` y una tercera función
+   con la misma estructura).
+4. `backend/controllers/controllerPreventa/ventasController.js` —
+   2 ocurrencias, en un contexto MÁS delicado: `obtenerRankingRutasDescartable`
+   tiene su propia lógica de migración histórica autoventa(`R%`)→
+   prevendedor(`PVR%`) con fecha de corte real (marzo 2026 transición,
+   abril 2026 en adelante solo `PVR%`) — el fix se aplicó como una
+   exclusión ortogonal a esa migración (`AND seller_code NOT ILIKE 'RUTA %'`
+   agregado a las 2 ramas que usan `R%`), sin tocar la lógica de
+   transición en sí.
+5. `backend/services/chatbotservicio/agente.service.js` — texto de
+   prompt (glosario de negocio) que describe la regla RURAL al chatbot;
+   actualizado para que el LLM no repita el mismo error al generar
+   respuestas sobre RURAL.
+
+`backend/controllers/controllerVentasPorRuta/ventasPorRutaController.js`
+(el endpoint que Alberto está construyendo para la liquidación) NO tenía
+el bug — filtra por `route_code` exacto, sin clasificación por grupo. Fue
+donde el problema se hizo visible (al comparar el total de una ruta
+puntual contra el total de RURAL), no la fuente.
+
+### Decisión de Alberto (confirmada antes de tocar nada)
+
+Grupo PROPIO: **`RUTA_COMBINADA`** — no excluidas del todo, quedan
+visibles en las tools/dashboards de grupo igual que los demás, separadas
+de RURAL. Alcance del fix: **mcp-server + los 4 archivos de backend**
+(confirmado explícitamente, no solo los 3 tools que se mencionaron en el
+reporte original).
+
+### Impacto real cuantificado (antes de arreglar nada, para saber qué tan grave era)
+
+**mcp-server — impacto real y visible, confirmado con datos reales**:
+mayo 2026, `grupo=RURAL` daba $211,610.59 combinando 2 cosas muy
+distintas — rutas rurales genuinas (R1-R6, R1.2: $65,823.59, el dato
+correcto) + las 4 rutas OK ($145,787.00, ~69% del total, dato que NO
+correspondía a RURAL). Después del fix, ambos números se separan
+limpio y la suma sigue cuadrando exacto ($65,823.59 + $145,787.00 =
+$211,610.59 — nada se perdió, solo se reclasificó).
+
+**Backend — los 4 archivos, investigado ANTES de asumir impacto real**:
+ninguno tiene impacto visible HOY en ningún dashboard ya desplegado —
+confirmado caso por caso, no asumido:
+- `consolidadoController.js`/`botellonesController.js` (ramas de
+  `ordenes`): `ordenes` NUNCA ha tenido filas reales con estos
+  `seller_code` (COTTSA solo las registra en `facturas`, confirmado con
+  datos reales al construir `ventasRutaOk.js`) — dormido.
+- `botellonesController.js` (ramas de `facturas`, status=2, SÍ tienen
+  ~10,334 documentos reales): pero de esos, **0 tienen línea de
+  categoría BOTELLÓN** — confirmado con SQL directo contra los datos
+  reales. Las rutas OK venden otros productos, no botellón — dormido
+  también, por una razón distinta (categoría de producto, no status).
+- `ventasController.js` (`obtenerRankingRutasDescartable`): filtra
+  `facturas.status = 5`, y estas rutas NUNCA tienen status=5 (solo 0 y
+  2, confirmado con datos reales) — dormido.
+
+Los 4 fixes de backend son correcciones de un riesgo latente real (si
+algún día estas rutas empiezan a vender botellón, o su status cambia de
+significado), no correcciones de un número que un usuario esté viendo
+mal HOY — por eso no fue necesario reconstruir/redesplegar
+`dashboard_backend` (el backend web en producción) para este fix; queda
+listo en el código para el próximo deploy normal del equipo.
+
+### Validación técnica (mcp-server)
+
+Nuevo test `clasificacionRutaCombinada-real.test.js`: confirma que
+RURAL ya no trae ninguna fila `'RUTA %'`, que RUTA_COMBINADA trae
+exactamente las 4 rutas esperadas, que la suma de ambos grupos cuadra, y
+que `clientesPorGrupo`/`resumenDiario` (2 de las 10 tools afectadas,
+representativas de las que usan la clasificación por `ordenes`+`facturas`
+combinadas vs. solo el resumen diario) reconocen el nuevo grupo
+correctamente. Suite completa (`seguridad-smoke-test`, `oauth-smoke-test`,
+`preventa-real`, `condicion-pago-real`) sin regresión —
+`backlogPrevendedores-real` sigue con el mismo date-drift ya conocido
+(no relacionado).
+
+### Fuera de alcance, decisión explícita (no una omisión)
+
+`RUTA_COMBINADA` NO se agregó como una tarjeta/columna NUEVA visible en
+los 3 dashboards de backend (`consolidadoController.js`/
+`botellonesController.js`/`ventasController.js`) — agregar un grupo
+nuevo a un dashboard visual real (posición de la tarjeta, color, ícono,
+metas configurables, permisos por rol/canal) es una decisión de
+diseño/producto que requiere coordinación con el frontend
+(`my-app`), no solo una corrección de clasificación de datos. Lo que sí
+se logró: esos 3 dashboards ya NO cuentan (ni dormido ni en vivo) estas
+4 rutas como RURAL — el bug de raíz está cerrado en las 5 ubicaciones.
+Si se quiere que `RUTA_COMBINADA` aparezca como su propia tarjeta en
+alguno de esos dashboards, es una tarea aparte.
+
+### Integración con `ventasPorRutaCondicion` (encontrada al mergear a `main`, 2026-09-29)
+
+`ventasPorRutaCondicion.js` no existía todavía cuando este fix se
+construyó (rama cortada antes), así que nunca se probaron juntos hasta el
+merge a `main`. Su test (`ventasPorRutaCondicion-real.test.js`) tenía una
+aserción que confirmaba el hallazgo VIEJO como comportamiento esperado
+("grupo=RURAL SÍ mezcla las rutas OK, no se corrige acá") — con este fix
+ya en `main`, esa aserción quedó obsoleta y el test falló al mergear.
+Corregida: ahora confirma que `grupo=RURAL` ya NO mezcla las 4 rutas y que
+`grupo=RUTA_COMBINADA` sí las trae — la tool reutiliza
+`CASE_GRUPO_FACTURAS`/`CASE_GRUPO_ORDENES` tal cual, así que el fix se
+propagó automáticamente sin tocar su código propio, solo el test
+necesitaba actualizarse.
+
 ## ✅ Mejora (bonus, pedida sin urgencia): commit/rama horneados en la imagen de `mcp_server`
 
 Pedido explícito del usuario: "hornea el commit SHA en el build de las

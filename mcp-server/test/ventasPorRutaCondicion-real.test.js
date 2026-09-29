@@ -75,12 +75,25 @@ async function main() {
     `EMPRESAS 2026-09-04: dolares_contado agregado (${contadoEmpresas.toFixed(2)}) == ventasPorCondicionPago (${contadoRef})`
   );
 
-  // 5) grupo=RURAL: confirmar el hallazgo de colisión documentado — las
-  //    rutas "RUTA 11X/13X" (de ventasRutaOk) SÍ aparecen mezcladas ahí,
-  //    tal cual la clasificación existente (no se corrige, se documenta).
+  // 5) grupo=RURAL / grupo=RUTA_COMBINADA — regresión del fix de
+  //    clasificacion.js (fix/clasificacion-ruta-ok-en-rural, mergeado a
+  //    `main` DESPUÉS de que esta tool ya existía): esta aserción antes
+  //    confirmaba el hallazgo de colisión (rutas "RUTA 11X/13X" mezcladas
+  //    en RURAL) como comportamiento documentado, no corregido. Ahora que
+  //    el fix está mergeado, `CASE_GRUPO_FACTURAS`/`CASE_GRUPO_ORDENES` ya
+  //    no las clasifica como RURAL — esta tool reutiliza esas mismas
+  //    funciones tal cual (ver header del archivo), así que el arreglo se
+  //    propaga automáticamente sin tocar código propio.
   const rural = await ventasPorRutaCondicion({ grupo: "RURAL", fecha_inicio: "2026-01-01", fecha_fin: "2026-09-21" });
   const rutasOkEnRural = rural.por_ruta.filter((r) => /^RUTA 1(13|31|32)/.test(r.ruta));
-  asegurar(rutasOkEnRural.length > 0, `grupo=RURAL: confirma que las rutas 'RUTA 11X/13X' SÍ aparecen mezcladas (${rutasOkEnRural.map((r) => r.ruta).join(", ")}) — hallazgo documentado, no corregido acá`);
+  asegurar(rutasOkEnRural.length === 0, `grupo=RURAL: ya NO mezcla las rutas 'RUTA 11X/13X' (fix propagado desde clasificacion.js)`);
+
+  const rutaCombinada = await ventasPorRutaCondicion({ grupo: "RUTA_COMBINADA", fecha_inicio: "2026-01-01", fecha_fin: "2026-09-21" });
+  const rutasEnRutaCombinada = rutaCombinada.por_ruta.filter((r) => /^RUTA 1(13|31|32)/.test(r.ruta));
+  asegurar(
+    rutasEnRutaCombinada.length > 0,
+    `grupo=RUTA_COMBINADA: SÍ trae las rutas 'RUTA 11X/13X' (${rutasEnRutaCombinada.map((r) => r.ruta).join(", ")})`
+  );
 
   // 6) Modo ruta con rutas sin ventas en el rango: deben aparecer en $0, no
   //    ausentes del todo.

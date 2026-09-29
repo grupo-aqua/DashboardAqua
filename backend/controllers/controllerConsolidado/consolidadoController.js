@@ -110,6 +110,14 @@ function qPreventa(inicio, fin) {
 }
 
 // 2. BOTELLONES — ordenes (autoventa sellers)
+// CORRECCIÓN 2026-09-29: `seller_code ILIKE 'R%'` (pensado para rutas
+// rurales genuinas) también matchea 'RUTA 113'/'RUTA 131'/'RUTA 132'/
+// 'RUTA 132.1' — esas rutas ya se cuentan aparte en la card "COTTSA"
+// (calcularCOTTSAMes, sección 5 más abajo). Sin esta exclusión, si algún
+// día `ordenes` llega a tener filas con esos seller_code (hoy no las
+// tiene, confirmado con datos reales — ver TODO.md), se duplicarían
+// contra la card COTTSA. Defensivo, mismo criterio que
+// mcp-server/src/sql/clasificacion.js.
 function qBotellonesOrdenes(inicio, fin) {
   return sequelize.query(`
     SELECT
@@ -121,6 +129,7 @@ function qBotellonesOrdenes(inicio, fin) {
     JOIN detalle_documento dd ON dd.documento_code = o.code
     WHERE dd.descripcion_categoria = 'BOTELLÓN'
       AND o.status IN (2,4,5)
+      AND o.seller_code NOT IN ('RUTA 113', 'RUTA 131', 'RUTA 132', 'RUTA 132.1')
       AND (
         o.seller_code ILIKE 'M%'
         OR o.seller_code ILIKE 'TV%'
