@@ -8,6 +8,8 @@
 // que delega el login real a Google y valida el dominio (hd).
 require("dotenv").config();
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 const express = require("express");
 const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { StreamableHTTPServerTransport } = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
@@ -317,7 +319,18 @@ app.post("/mcp", exigirBearerToken, mcpPostHandler);
 app.get("/mcp", exigirBearerToken, mcpGetHandler);
 app.delete("/mcp", exigirBearerToken, mcpDeleteHandler);
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+// Commit/rama/fecha horneados en la imagen por el Dockerfile (ver
+// scripts/deploy.sh) — se lee una sola vez al arrancar. Si el archivo no
+// existe (ej. corriendo `node src/server.js` suelto fuera de Docker, sin
+// build), cae a "unknown" en vez de tumbar el arranque.
+let versionInfo = { commit: "unknown", branch: "unknown", build_date: "unknown" };
+try {
+  versionInfo = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "VERSION.json"), "utf8"));
+} catch {
+  // Sin VERSION.json (build local fuera de Docker) — se queda en "unknown".
+}
+
+app.get("/health", (_req, res) => res.json({ ok: true, version: versionInfo }));
 
 const PORT = Number(process.env.PORT) || 8787;
 app.listen(PORT, () => {

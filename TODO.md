@@ -4044,6 +4044,40 @@ Suite completa (`node:20-alpine`) 7/7 OK (`seguridad-smoke-test`,
 `notasCredito-real.test.js` no se corrió, deriva de datos preexistente ya
 reportada aparte, sin relación a este fix.
 
+## ✅ Mejora (bonus, pedida sin urgencia): commit/rama horneados en la imagen de `mcp_server`
+
+Pedido explícito del usuario: "hornea el commit SHA en el build de las
+imágenes (LABEL o archivo VERSION) para no tener que reconstruir el
+estado del disco cada vez que alguien pregunta qué está corriendo" — hasta
+ahora, confirmar qué código corría en el contenedor vivo requería
+`docker exec mcp_server grep ...` + cruzar a mano contra `git log` del
+host (sin `git` instalado dentro de la imagen).
+
+**Implementado**: `mcp-server/Dockerfile` acepta `ARG GIT_COMMIT`/
+`GIT_BRANCH`/`BUILD_DATE` (default `"unknown"` si no se pasan — nunca
+rompe un build suelto), los graba como `LABEL` de la imagen y en un
+`/app/VERSION.json` horneado en el build. `docker-compose.yml` pasa esos
+build-args desde variables de entorno del shell (`${GIT_COMMIT:-unknown}`,
+etc.). `src/server.js` lee ese `VERSION.json` una sola vez al arrancar
+(con fallback a "unknown" si no existe, ej. corriendo `node
+src/server.js` suelto fuera de Docker) y lo expone en `GET /health` junto
+al `ok:true` de siempre. Nuevo `scripts/deploy-mcp-server.sh` (raíz del
+repo) calcula `GIT_COMMIT`/`GIT_BRANCH`/`BUILD_DATE` automáticamente desde
+`git` y corre `docker compose build/up mcp_server` — reemplaza el comando
+manual usado hasta ahora en cada deploy de esta sesión.
+
+Validado con un build standalone (`docker build --build-arg ...`, sin
+tocar el contenedor de producción — esta rama está cortada de `main`, no
+tiene `ventasRutaOk`/`facturasProveedores` todavía): `VERSION.json` dentro
+de la imagen con los valores correctos, contenedor de prueba levantado en
+un puerto aparte, `GET /health` devolviendo
+`{"ok":true,"version":{"commit":"...","branch":"chore/version-en-build","build_date":"..."}}`
+— contenedor e imagen de prueba eliminados después. `docker compose
+config` confirma que el `docker-compose.yml` sigue parseando bien con los
+nuevos `args`. NO se redesplegó `mcp_server` en producción con este
+cambio — es una mejora de observabilidad, no urgente (pedido explícito del
+usuario), pendiente de aplicarse la próxima vez que se reconstruya el
+contenedor real (o antes, si se pide).
 ## ✅ Nueva tool: `ventasRutaOk` — combinado COTTSA + aqua-premium-ne de las rutas "OK" (113/131/132), sin deduplicar todavía
 
 ### El pedido (gerencia, vía Alberto)

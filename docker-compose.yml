@@ -83,7 +83,12 @@ services:
   # (passwords de DB, MCP_JWT_SECRET, credenciales de Google) vienen de
   # mcp-server/.env vía env_file, no inline acá, para no commitearlos.
   mcp_server:
-    build: ./mcp-server
+    build:
+      context: ./mcp-server
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        GIT_BRANCH: ${GIT_BRANCH:-unknown}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
     container_name: mcp_server
     restart: always
     env_file:
