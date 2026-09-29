@@ -50,6 +50,22 @@
 // en una tarea propia.
 //
 // ============================================================
+// ============================================================
+// Fallback de Odoo para dolares_sin_dato (Bug 2, pedido explícito del
+// usuario, 2026-09-29) — mismo mecanismo ya cableado en
+// ventasPorCondicionPago.js (ver odooCondicionPagoFallback.js para la
+// investigación completa). Se cruza por RUC contra Odoo
+// (property_payment_term_id → invoice_payment_term_id) y lo resuelto se
+// mueve de `dolares_sin_dato`/`num_documentos_sin_dato` a
+// `dolares_contado`/`dolares_credito` en la fila de SU ruta. SOLO afecta
+// filas con fuente_condicion='METODO_PAGO_CLIENTE' — las de
+// fuente_condicion='NOTA_CREDITO' YA se segregan aparte en
+// dolares_nota_credito (ver agregarPorRuta más abajo), nunca caen en
+// dolares_sin_dato, así que no son candidatas a este fallback. SOLO
+// LECTURA, degrada con gracia si Odoo no responde (nunca rompe un
+// resultado que ya era válido sin el fallback).
+//
+// ============================================================
 // aqua-premium-ne (requisito #2) — mismo manejo especial que ventasRutaOk
 // ============================================================
 // Solo aplica en modo `ruta` (nunca en modo `grupo`, aunque `grupo=RURAL`
@@ -72,6 +88,7 @@ const { z } = require("zod");
 const { pool } = require("../db");
 const { finExclusivo, diffDias } = require("../util/fechas");
 const { executeKw } = require("../integrations/aquaPremiumNe");
+const { resolverCondicionPagoOdoo } = require("../integrations/odooCondicionPagoFallback");
 const {
   CASE_GRUPO_ORDENES,
   FILTRO_ORDENES_GRUPO_VALIDO,
@@ -203,6 +220,105 @@ const SQL_GRUPO_PREVENTA = `
   GROUP BY o.seller_code, condicion_pago, fuente_condicion;
 `;
 
+// Fallback de Odoo (Bug 2), modo grupo — MISMO WHERE base que SQL_GRUPO,
+// agrupado por (ruta, cliente) en vez de (ruta, condicion_pago,
+// fuente_condicion), filtrado a SIN_DATO con fuente_condicion !=
+// 'NOTA_CREDITO' (ver comentario grande arriba: esos ya se segregan aparte
+// y no pasan por dolares_sin_dato). $1=grupo, $2=inicio, $3=fin exclusivo,
+// $4=categoria (o NULL).
+const SQL_GRUPO_SIN_DATO_CLIENTES = `
+  WITH base AS (
+    SELECT
+      o.seller_code AS ruta_val,
+      o.customer_code AS customer_code,
+      TRIM(c.identificacion_cliente) AS ruc,
+      ${CONDICION_PAGO_CLIENTE("c")} AS condicion_pago,
+      ${FUENTE_CONDICION_PAGO_CLIENTE} AS fuente_condicion,
+      dd.total    AS dolares,
+      o.code      AS doc_code
+    FROM ordenes o
+    JOIN detalle_documento dd ON dd.documento_code = o.code
+    LEFT JOIN clientes c ON c.codigo_cliente = o.customer_code
+    WHERE o.status = 2
+      AND o.origen_sistema = 'MOBILVENDOR'
+      AND ${FILTRO_ORDENES_GRUPO_VALIDO}
+      AND (${CASE_GRUPO_ORDENES}) = $1
+      AND ${FILTRO_CLIENTE_VALIDO("o.customer_code")}
+      AND o.fecha_creacion >= $2 AND o.fecha_creacion < $3
+      AND ($4::text IS NULL OR dd.descripcion_categoria = $4)
+
+    UNION ALL
+
+    SELECT
+      f.seller_code AS ruta_val,
+      f.customer_code AS customer_code,
+      TRIM(c.identificacion_cliente) AS ruc,
+      ${CONDICION_PAGO_FACTURA("f", "c")} AS condicion_pago,
+      ${FUENTE_CONDICION_PAGO_FACTURA("f")} AS fuente_condicion,
+      CASE WHEN f.tipo_movimiento = 'out_refund' THEN -dd.total ELSE dd.total END AS dolares,
+      f.code AS doc_code
+    FROM facturas f
+    JOIN detalle_documento dd ON dd.documento_code = f.code
+    LEFT JOIN clientes c ON c.codigo_cliente = f.customer_code
+    WHERE f.status = 2
+      AND (${CASE_GRUPO_FACTURAS}) = $1
+      AND ${FILTRO_CLIENTE_VALIDO("f.customer_code")}
+      AND f.fecha_creacion >= $2 AND f.fecha_creacion < $3
+      AND ($4::text IS NULL OR dd.descripcion_categoria = $4)
+
+    UNION ALL
+
+    SELECT
+      o.seller_code AS ruta_val,
+      o.customer_code AS customer_code,
+      TRIM(c.identificacion_cliente) AS ruc,
+      ${CONDICION_PAGO_CLIENTE("c")} AS condicion_pago,
+      ${FUENTE_CONDICION_PAGO_CLIENTE} AS fuente_condicion,
+      dd.total    AS dolares,
+      o.code      AS doc_code
+    FROM ordenes o
+    JOIN detalle_documento dd ON dd.documento_code = o.code
+    LEFT JOIN clientes c ON c.codigo_cliente = o.customer_code
+    WHERE o.status = 2
+      AND o.equipo_ventas = 'Website'
+      AND ${FILTRO_CLIENTE_VALIDO("o.customer_code")}
+      AND $1 = 'DOMICILIO'
+      AND o.fecha_creacion >= $2 AND o.fecha_creacion < $3
+      AND ($4::text IS NULL OR dd.descripcion_categoria = $4)
+  )
+  SELECT ruta_val, customer_code, ruc,
+    SUM(dolares) AS dolares, COUNT(DISTINCT doc_code) AS num_documentos
+  FROM base
+  WHERE condicion_pago = 'SIN_DATO' AND fuente_condicion != 'NOTA_CREDITO'
+    AND ruc IS NOT NULL AND ruc != ''
+  GROUP BY ruta_val, customer_code, ruc;
+`;
+
+// Fallback de Odoo (Bug 2), modo grupo + PREVENTA — PREVENTA nunca tiene
+// fuente_condicion='NOTA_CREDITO' (solo ordenes, nunca facturas), así que
+// no hace falta ese filtro acá.
+const SQL_GRUPO_PREVENTA_SIN_DATO_CLIENTES = `
+  SELECT
+    o.seller_code AS ruta_val,
+    o.customer_code AS customer_code,
+    TRIM(c.identificacion_cliente) AS ruc,
+    SUM(dd.total) AS dolares,
+    COUNT(DISTINCT o.code) AS num_documentos
+  FROM ordenes o
+  JOIN detalle_documento dd ON dd.documento_code = o.code
+  LEFT JOIN clientes c ON c.codigo_cliente = o.customer_code
+  WHERE o.type = 2
+    AND o.status = 5
+    AND ${FILTRO_PREVENTA_SELLER("$3")}
+    AND ${FILTRO_CLIENTE_VALIDO("o.customer_code")}
+    AND dd.descripcion_categoria = $3
+    AND o.fecha_entrega >= $1 AND o.fecha_entrega < $2
+    AND (${CONDICION_PAGO_CLIENTE("c")}) = 'SIN_DATO'
+    AND TRIM(c.identificacion_cliente) IS NOT NULL
+    AND TRIM(c.identificacion_cliente) != ''
+  GROUP BY o.seller_code, o.customer_code, TRIM(c.identificacion_cliente);
+`;
+
 // ============================================================
 // MODO RUTA — mismo WHERE base que ventasPorRuta.js (filtra seller_code
 // directo, SIN FILTRO_CLIENTE_VALIDO — mismo comportamiento ya existente
@@ -289,6 +405,97 @@ const SQL_RUTA_PREVENTA = `
   GROUP BY o.seller_code, condicion_pago, fuente_condicion;
 `;
 
+// Fallback de Odoo (Bug 2), modo ruta — MISMO WHERE base que SQL_RUTA,
+// agrupado por (ruta, cliente), filtrado a SIN_DATO sin NOTA_CREDITO (ver
+// comentario grande arriba). $1=rutas[], $2=inicio, $3=fin exclusivo,
+// $4=categoria (o NULL).
+const SQL_RUTA_SIN_DATO_CLIENTES = `
+  WITH base AS (
+    SELECT
+      o.seller_code AS ruta_val,
+      o.customer_code AS customer_code,
+      TRIM(c.identificacion_cliente) AS ruc,
+      ${CONDICION_PAGO_CLIENTE("c")} AS condicion_pago,
+      ${FUENTE_CONDICION_PAGO_CLIENTE} AS fuente_condicion,
+      dd.total    AS dolares,
+      o.code      AS doc_code
+    FROM ordenes o
+    JOIN detalle_documento dd ON dd.documento_code = o.code
+    LEFT JOIN clientes c ON c.codigo_cliente = o.customer_code
+    WHERE o.status = 2
+      AND o.origen_sistema = 'MOBILVENDOR'
+      AND o.seller_code = ANY($1::text[])
+      AND o.fecha_creacion >= $2 AND o.fecha_creacion < $3
+      AND ($4::text IS NULL OR dd.descripcion_categoria = $4)
+
+    UNION ALL
+
+    SELECT
+      f.seller_code AS ruta_val,
+      f.customer_code AS customer_code,
+      TRIM(c.identificacion_cliente) AS ruc,
+      ${CONDICION_PAGO_FACTURA("f", "c")} AS condicion_pago,
+      ${FUENTE_CONDICION_PAGO_FACTURA("f")} AS fuente_condicion,
+      CASE WHEN f.tipo_movimiento = 'out_refund' THEN -dd.total ELSE dd.total END AS dolares,
+      f.code AS doc_code
+    FROM facturas f
+    JOIN detalle_documento dd ON dd.documento_code = f.code
+    LEFT JOIN clientes c ON c.codigo_cliente = f.customer_code
+    WHERE f.status = 2
+      AND f.seller_code = ANY($1::text[])
+      AND f.fecha_creacion >= $2 AND f.fecha_creacion < $3
+      AND ($4::text IS NULL OR dd.descripcion_categoria = $4)
+
+    UNION ALL
+
+    SELECT
+      o.seller_code AS ruta_val,
+      o.customer_code AS customer_code,
+      TRIM(c.identificacion_cliente) AS ruc,
+      ${CONDICION_PAGO_CLIENTE("c")} AS condicion_pago,
+      ${FUENTE_CONDICION_PAGO_CLIENTE} AS fuente_condicion,
+      dd.total    AS dolares,
+      o.code      AS doc_code
+    FROM ordenes o
+    JOIN detalle_documento dd ON dd.documento_code = o.code
+    LEFT JOIN clientes c ON c.codigo_cliente = o.customer_code
+    WHERE o.status = 2
+      AND o.equipo_ventas = 'Website'
+      AND o.seller_code = ANY($1::text[])
+      AND o.fecha_creacion >= $2 AND o.fecha_creacion < $3
+      AND ($4::text IS NULL OR dd.descripcion_categoria = $4)
+  )
+  SELECT ruta_val, customer_code, ruc,
+    SUM(dolares) AS dolares, COUNT(DISTINCT doc_code) AS num_documentos
+  FROM base
+  WHERE condicion_pago = 'SIN_DATO' AND fuente_condicion != 'NOTA_CREDITO'
+    AND ruc IS NOT NULL AND ruc != ''
+  GROUP BY ruta_val, customer_code, ruc;
+`;
+
+// Fallback de Odoo (Bug 2), modo ruta + PREVENTA — mismo motivo que en modo
+// grupo, PREVENTA nunca tiene fuente_condicion='NOTA_CREDITO'.
+const SQL_RUTA_PREVENTA_SIN_DATO_CLIENTES = `
+  SELECT
+    o.seller_code AS ruta_val,
+    o.customer_code AS customer_code,
+    TRIM(c.identificacion_cliente) AS ruc,
+    SUM(dd.total) AS dolares,
+    COUNT(DISTINCT o.code) AS num_documentos
+  FROM ordenes o
+  JOIN detalle_documento dd ON dd.documento_code = o.code
+  LEFT JOIN clientes c ON c.codigo_cliente = o.customer_code
+  WHERE o.type = 2
+    AND o.status = 5
+    AND o.seller_code = ANY($1::text[])
+    AND ${FILTRO_PREVENTA_SELLER("dd.descripcion_categoria")}
+    AND o.fecha_entrega >= $2 AND o.fecha_entrega < $3
+    AND (${CONDICION_PAGO_CLIENTE("c")}) = 'SIN_DATO'
+    AND TRIM(c.identificacion_cliente) IS NOT NULL
+    AND TRIM(c.identificacion_cliente) != ''
+  GROUP BY o.seller_code, o.customer_code, TRIM(c.identificacion_cliente);
+`;
+
 // Agrega filas crudas (ruta_val, condicion_pago, fuente_condicion, unidades,
 // dolares, num_documentos) en un mapa por ruta con los buckets pedidos.
 function agregarPorRuta(rows, mapa) {
@@ -331,6 +538,57 @@ function agregarPorRuta(rows, mapa) {
 
     mapa.set(ruta, fila);
   }
+}
+
+// Intenta resolver por Odoo los clientes SIN_DATO de `sinDatoRows` (filas
+// de SQL_*_SIN_DATO_CLIENTES: ruta_val, customer_code, ruc, dolares,
+// num_documentos) y mueve lo resuelto de dolares_sin_dato a
+// dolares_contado/dolares_credito EN LA FILA DE SU RUTA dentro de `mapa`
+// (mutación in-place, mismo patrón que agregarPorRuta). Degradación con
+// gracia: cualquier fallo consultando Odoo se atrapa acá, se reporta en
+// `fallback_odoo.error` y el resto del resultado (ya válido sin el
+// fallback) queda intacto.
+async function aplicarFallbackOdooPorRuta(mapa, sinDatoRows) {
+  const filasConRuc = (sinDatoRows || []).filter((r) => r.ruc);
+  const resumen = { intentados: filasConRuc.length, resueltos: 0, dolares_resueltos: 0, error: null };
+  if (filasConRuc.length === 0) return resumen;
+
+  let resoluciones;
+  try {
+    resoluciones = await resolverCondicionPagoOdoo(filasConRuc.map((r) => r.ruc));
+  } catch (err) {
+    resumen.error = `No se pudo consultar Odoo para el fallback: ${err.message}`;
+    return resumen;
+  }
+
+  for (const fila of filasConRuc) {
+    const resolucion = resoluciones.get(fila.ruc);
+    if (!resolucion) continue; // Odoo tampoco lo tiene — sigue SIN_DATO.
+
+    const ruta = fila.ruta_val || "SIN_RUTA_ASIGNADA";
+    const filaRuta = mapa.get(ruta);
+    if (!filaRuta) continue; // defensivo: ruta_val sale del mismo universo que agregarPorRuta
+
+    const dolares = Number(fila.dolares) || 0;
+    const numDocs = Number(fila.num_documentos) || 0;
+
+    filaRuta.dolares_sin_dato -= dolares;
+    filaRuta.num_documentos_sin_dato -= numDocs;
+
+    if (resolucion.condicion_pago === "CONTADO") {
+      filaRuta.dolares_contado += dolares;
+      filaRuta.num_documentos_contado += numDocs;
+    } else {
+      filaRuta.dolares_credito += dolares;
+      filaRuta.num_documentos_credito += numDocs;
+    }
+
+    resumen.resueltos++;
+    resumen.dolares_resueltos += dolares;
+  }
+
+  resumen.dolares_resueltos = Number(resumen.dolares_resueltos.toFixed(2));
+  return resumen;
 }
 
 // Suma en vivo la contribución de aqua-premium-ne (100% CONTADO, ver
@@ -401,15 +659,23 @@ async function ventasPorRutaCondicion({ ruta, grupo, categoria, fecha_inicio, fe
   const finTs = `${finExclusivo(fecha_fin)} 00:00:00`;
   const mapa = new Map();
 
+  let fallback_odoo;
+
   if (grupo) {
     const esPreventa = grupo === "PREVENTA";
     if (esPreventa) {
       const categoriaEfectiva = categoria || CATEGORIA_PREVENTA;
-      const { rows } = await pool.query(SQL_GRUPO_PREVENTA, [inicioTs, finTs, categoriaEfectiva]);
+      const params = [inicioTs, finTs, categoriaEfectiva];
+      const { rows } = await pool.query(SQL_GRUPO_PREVENTA, params);
       agregarPorRuta(rows, mapa);
+      const { rows: sinDatoRows } = await pool.query(SQL_GRUPO_PREVENTA_SIN_DATO_CLIENTES, params);
+      fallback_odoo = await aplicarFallbackOdooPorRuta(mapa, sinDatoRows);
     } else {
-      const { rows } = await pool.query(SQL_GRUPO, [grupo, inicioTs, finTs, categoria ?? null]);
+      const params = [grupo, inicioTs, finTs, categoria ?? null];
+      const { rows } = await pool.query(SQL_GRUPO, params);
       agregarPorRuta(rows, mapa);
+      const { rows: sinDatoRows } = await pool.query(SQL_GRUPO_SIN_DATO_CLIENTES, params);
+      fallback_odoo = await aplicarFallbackOdooPorRuta(mapa, sinDatoRows);
     }
   } else {
     const rutasSolicitadas = Array.isArray(ruta) ? ruta : [ruta];
@@ -443,6 +709,16 @@ async function ventasPorRutaCondicion({ ruta, grupo, categoria, fecha_inicio, fe
       }
     }
 
+    const [resultSinDatoNormal, resultSinDatoPreventa] = await Promise.all([
+      rutasNormales.length
+        ? pool.query(SQL_RUTA_SIN_DATO_CLIENTES, [rutasNormales, inicioTs, finTs, categoria ?? null])
+        : Promise.resolve({ rows: [] }),
+      rutasPreventa.length
+        ? pool.query(SQL_RUTA_PREVENTA_SIN_DATO_CLIENTES, [rutasPreventa, inicioTs, finTs, categoria ?? null])
+        : Promise.resolve({ rows: [] }),
+    ]);
+    fallback_odoo = await aplicarFallbackOdooPorRuta(mapa, [...resultSinDatoNormal.rows, ...resultSinDatoPreventa.rows]);
+
     await fusionarAquaPremiumNe(mapa, fecha_inicio, finExclusivo(fecha_fin));
   }
 
@@ -458,6 +734,7 @@ async function ventasPorRutaCondicion({ ruta, grupo, categoria, fecha_inicio, fe
     dolares_totales: totales.dolares_totales,
     num_documentos: totales.num_documentos,
     por_ruta,
+    fallback_odoo,
   };
 }
 
