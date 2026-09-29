@@ -73,11 +73,17 @@ const obtenerMetasHistoricasPreventas = async () => {
 };
 
 const obtenerMetaHistoricaGlobal = async () => {
+  // CORRECCIÓN 2026-09-29: `seller_code ILIKE 'R%'` también matchea
+  // 'RUTA 113'/'RUTA 131'/'RUTA 132'/'RUTA 132.1' (rutas OK, manejadas
+  // aparte en mcp-server/ventasRutaOk.js) — se excluyen explícitamente.
+  // Defensivo: `ordenes` no tiene hoy filas reales con esos seller_code
+  // (confirmado con datos reales), así que no cambia el resultado actual.
   const sql = `
     SELECT MAX(total_mes) AS meta_global FROM (
       SELECT DATE_TRUNC('month', o.fecha_entrega) as mes, SUM(dd.total) AS total_mes
       FROM ordenes o JOIN detalle_documento dd ON dd.documento_code = o.code
       WHERE dd.codigo_categoria = '7' AND o.status IN (2,4,5)
+        AND o.seller_code NOT ILIKE 'RUTA %'
         AND (o.seller_code ILIKE 'PV%' OR o.seller_code ILIKE 'PREVENTA%'
           OR o.seller_code ILIKE 'TELEVENTA%' OR o.seller_code ILIKE 'R%')
       GROUP BY DATE_TRUNC('month', o.fecha_entrega)
@@ -190,15 +196,21 @@ const obtenerRankingRutasDescartable = async (anioNum, mesNum, metasPorPreventa,
   // Desde abril 2026 → SOLO prevendedores (PVR%).
   const esTransicion = (a, m) => a === 2026 && m === 3;
   const soloPVR = (a, m) => (a > 2026) || (a === 2026 && m >= 4);
+  // CORRECCIÓN 2026-09-29: `R%` también matchea 'RUTA 113'/'RUTA 131'/
+  // 'RUTA 132'/'RUTA 132.1' (rutas OK, ajenas a esta migración
+  // autoventa→prevendedor) — se excluyen explícitamente en las 2 ramas
+  // que usan `R%`. Defensivo hoy (esas facturas nunca tienen status=5,
+  // el único status que esta consulta mira — confirmado con datos
+  // reales), pero cierra el riesgo si eso cambiara.
   const buildSellerFilter = (alias, a, m) => {
     if (esTransicion(a, m)) {
       // R% no captura PVR% porque PVR empieza con P, no con R.
       // Necesitamos ambos prefijos explícitos.
-      return `(${alias}.seller_code ILIKE 'R%' OR ${alias}.seller_code ILIKE 'PVR%')`;
+      return `((${alias}.seller_code ILIKE 'R%' AND ${alias}.seller_code NOT ILIKE 'RUTA %') OR ${alias}.seller_code ILIKE 'PVR%')`;
     }
     return soloPVR(a, m)
       ? `${alias}.seller_code ILIKE 'PVR%'`
-      : `(${alias}.seller_code ILIKE 'R%' AND ${alias}.seller_code NOT ILIKE 'PVR%')`;
+      : `(${alias}.seller_code ILIKE 'R%' AND ${alias}.seller_code NOT ILIKE 'PVR%' AND ${alias}.seller_code NOT ILIKE 'RUTA %')`;
   };
 
   const filtroOActual = buildSellerFilter('o', anioNum,  mesNum);

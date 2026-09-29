@@ -19,7 +19,9 @@ const {
   inputSchema: inputSchemaVentasPorCondicionPago,
 } = require("../src/tools/ventasPorCondicionPago");
 const { backlogPrevendedores, inputSchema: inputSchemaBacklogPrevendedores } = require("../src/tools/backlogPrevendedores");
+const { inputSchema: inputSchemaVentasRutaOk, RUTAS_OK_VALIDAS } = require("../src/tools/ventasRutaOk");
 const { inputSchema: inputSchemaFacturasProveedores, COMPANIAS_VALIDAS } = require("../src/tools/facturasProveedores");
+const { ventasPorRutaCondicion, inputSchema: inputSchemaVentasPorRutaCondicion } = require("../src/tools/ventasPorRutaCondicion");
 const { inputSchema: inputSchemaAuditoriaClientes, CATEGORIAS_VALIDAS: CATEGORIAS_AUDITORIA_VALIDAS } = require("../src/tools/auditoriaClientes");
 const { pool } = require("../src/db");
 
@@ -390,7 +392,30 @@ async function main() {
   if (!rowsOrdenes2[0].existe) throw new Error("FALLO: la tabla ordenes ya no existe (inyección exitosa vía backlogPrevendedores)");
   console.log("OK: la tabla `ordenes` sigue existiendo intacta (payload vía backlogPrevendedores).");
 
-  // 16) facturasProveedores (nuevo): no toca Postgres en absoluto (todo va
+  // 16) ventasRutaOk (nuevo): a diferencia de las demás tools, `ruta` NO es
+  //     texto libre validado por regex — es z.enum(['113','131','132']),
+  //     así que un payload de inyección se rechaza directo por no ser uno
+  //     de esos 3 valores literales, sin necesidad de probar el bypass a
+  //     nivel de query (`ruta` solo indexa un objeto de configuración fijo
+  //     en JS — RUTAS_OK — nunca se concatena ni se pasa a SQL).
+  const schemaVentasRutaOk = z.object(inputSchemaVentasRutaOk);
+  const parseoVentasRutaOkInyeccion = schemaVentasRutaOk.safeParse({
+    ruta: payload,
+    fecha_inicio: "2026-01-01",
+    fecha_fin: "2026-01-31",
+  });
+  if (parseoVentasRutaOkInyeccion.success) throw new Error("FALLO: zod aceptó un payload de inyección en `ruta` de ventasRutaOk");
+  console.log("OK: zod rechazó el payload de inyección en `ruta` de ventasRutaOk ->", parseoVentasRutaOkInyeccion.error.issues[0].message);
+
+  const parseoVentasRutaOkArray = schemaVentasRutaOk.safeParse({
+    ruta: RUTAS_OK_VALIDAS,
+    fecha_inicio: "2026-01-01",
+    fecha_fin: "2026-01-31",
+  });
+  if (!parseoVentasRutaOkArray.success) throw new Error("FALLO: zod rechazó el array de rutas OK válidas (113/131/132) en ventasRutaOk");
+  console.log("OK: ventasRutaOk acepta el array de las 3 rutas OK válidas.");
+
+  // 17) facturasProveedores (nuevo): no toca Postgres en absoluto (todo va
   //     a Odoo vía JSON-RPC) — no hay `pool.query` que proteger acá. `compania`
   //     es z.enum(...) igual que ventasRutaOk: un payload de inyección se
   //     rechaza directo por no ser uno de los 5 alias válidos, sin necesidad
@@ -423,7 +448,58 @@ async function main() {
   if (parseoFacturasProveedoresTipoInyeccion.success) throw new Error("FALLO: zod aceptó un payload de inyección en `tipo_documento` de facturasProveedores");
   console.log("OK: zod rechazó el payload de inyección en `tipo_documento` de facturasProveedores ->", parseoFacturasProveedoresTipoInyeccion.error.issues[0].message);
 
-  // 18) auditoriaClientes (nuevo): sin superficie de inyección SQL en
+  // 18) ventasPorRutaCondicion (nuevo): `ruta` es texto libre (mismo patrón
+  //     que ventasPorRuta) — un payload de inyección debe rechazarse por
+  //     la regex de zod antes de tocar la query.
+  const schemaVentasPorRutaCondicion = z.object(inputSchemaVentasPorRutaCondicion);
+  const parseoVPRCInyeccion = schemaVentasPorRutaCondicion.safeParse({
+    ruta: payload,
+    fecha_inicio: "2026-01-01",
+    fecha_fin: "2026-01-31",
+  });
+  if (parseoVPRCInyeccion.success) throw new Error("FALLO: zod aceptó un payload de inyección en `ruta` de ventasPorRutaCondicion");
+  console.log("OK: zod rechazó el payload de inyección en `ruta` de ventasPorRutaCondicion ->", parseoVPRCInyeccion.error.issues[0].message);
+
+  // Aunque alguien se salte zod y llame la función interna directo con el
+  // payload como `ruta` (bypaseando la regex), pg debe seguir tratándolo
+  // como texto literal ($1::text[] posicional) — no debe lanzar error de
+  // sintaxis ni afectar la tabla.
+  const resultadoVPRCInyeccion = await ventasPorRutaCondicion({
+    ruta: payload,
+    fecha_inicio: "2026-01-01",
+    fecha_fin: "2026-01-31",
+  });
+  console.log(
+    "OK: ventasPorRutaCondicion con ruta maliciosa no lanzó error de sintaxis ->",
+    JSON.stringify({ dolares_totales: resultadoVPRCInyeccion.dolares_totales })
+  );
+
+  const { rows: rowsOrdenes3 } = await pool.query("SELECT to_regclass('ordenes') AS existe");
+  if (!rowsOrdenes3[0].existe) throw new Error("FALLO: la tabla ordenes ya no existe (inyección exitosa vía ventasPorRutaCondicion)");
+  console.log("OK: la tabla `ordenes` sigue existiendo intacta (payload vía ventasPorRutaCondicion).");
+
+  // `ruta` y `grupo` son excluyentes — ambos o ninguno debe fallar antes de
+  // tocar la base (validación propia de la función, no de zod, ya que zod
+  // no puede expresar "exactamente uno de dos campos opcionales").
+  let fallóAmbos = false;
+  try {
+    await ventasPorRutaCondicion({ ruta: "T5", grupo: "TIENDAS", fecha_inicio: "2026-01-01", fecha_fin: "2026-01-31" });
+  } catch {
+    fallóAmbos = true;
+  }
+  if (!fallóAmbos) throw new Error("FALLO: ventasPorRutaCondicion aceptó `ruta` y `grupo` juntos, deberían ser excluyentes");
+  console.log("OK: ventasPorRutaCondicion rechaza pedir `ruta` y `grupo` juntos.");
+
+  let fallóNinguno = false;
+  try {
+    await ventasPorRutaCondicion({ fecha_inicio: "2026-01-01", fecha_fin: "2026-01-31" });
+  } catch {
+    fallóNinguno = true;
+  }
+  if (!fallóNinguno) throw new Error("FALLO: ventasPorRutaCondicion aceptó no pedir ni `ruta` ni `grupo`");
+  console.log("OK: ventasPorRutaCondicion rechaza no pedir ni `ruta` ni `grupo`.");
+
+  // 19) auditoriaClientes (nuevo): sin superficie de inyección SQL en
   //     absoluto — todo el SQL es texto estático, los únicos parámetros de
   //     usuario son `categoria` (z.enum cerrado), `umbral_dias_inactividad`
   //     y `limite` (ambos z.number().int(), zod ya rechaza cualquier string).

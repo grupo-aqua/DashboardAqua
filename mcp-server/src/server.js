@@ -8,6 +8,8 @@
 // que delega el login real a Google y valida el dominio (hd).
 require("dotenv").config();
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 const express = require("express");
 const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { StreamableHTTPServerTransport } = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
@@ -30,7 +32,9 @@ const { clientesSinConsumo, inputSchema: schemaClientesSinConsumo } = require(".
 const { clientesSinVisita, inputSchema: schemaClientesSinVisita } = require("./tools/clientesSinVisita");
 const { clientesVisitadosSinVenta, inputSchema: schemaClientesVisitadosSinVenta } = require("./tools/clientesVisitadosSinVenta");
 const { ventasPorCondicionPago, inputSchema: schemaVentasPorCondicionPago } = require("./tools/ventasPorCondicionPago");
+const { ventasPorRutaCondicion, inputSchema: schemaVentasPorRutaCondicion } = require("./tools/ventasPorRutaCondicion");
 const { backlogPrevendedores, inputSchema: schemaBacklogPrevendedores } = require("./tools/backlogPrevendedores");
+const { ventasRutaOk, inputSchema: schemaVentasRutaOk } = require("./tools/ventasRutaOk");
 const { facturasProveedores, inputSchema: schemaFacturasProveedores } = require("./tools/facturasProveedores");
 const { auditoriaClientes, inputSchema: schemaAuditoriaClientes } = require("./tools/auditoriaClientes");
 
@@ -172,6 +176,16 @@ function crearServer() {
   );
 
   server.registerTool(
+    "ventasRutaOk",
+    {
+      description:
+        "Ventas combinadas de las rutas 'OK' (113, 131, 132 — 132 incluye 'RUTA 132' y 'RUTA 132.1' de COTTSA) en un rango de fechas: total_combinado + desglose por_cliente (identificado por RUC, consolidando ambas fuentes) + por_fuente (COTTSA facturado vs. aqua-premium-ne no facturado). FASE ACTUAL (instrucción explícita de Alberto, no cambiar sin confirmar con él): son los totales CRUDOS de cada sistema, sin ningún intento de deduplicar entre las dos fuentes — existe un riesgo de doble conteo detectado y documentado en TODO.md (COTTSA ya factura bajo estos mismos seller_code) que Alberto va a verificar manualmente antes de pedir una fase de limpieza. aqua-premium-ne (la fuente no facturada) se consulta EN VIVO a un Odoo externo en cada llamada — si no responde, la tool falla explícitamente en vez de mostrar $0. IMPORTANTE: aqua-premium-ne no tiene ninguna venta registrada para estas 3 rutas después del 2026-06-09 (confirmado, no es un bug) — la respuesta trae advertencia_aqua_premium_ne cuando el rango pedido cae después de esa fecha, para no leer un $0 de esa fuente como 'no hubo ventas OK'. ruta acepta un código ('113'/'131'/'132') o un array de varios; por defecto (sin especificar) trae las 3 combinadas con desglose por_ruta.",
+      inputSchema: schemaVentasRutaOk,
+    },
+    async (args) => resultadoTexto(await ventasRutaOk(args))
+  );
+
+  server.registerTool(
     "facturasProveedores",
     {
       description:
@@ -179,6 +193,16 @@ function crearServer() {
       inputSchema: schemaFacturasProveedores,
     },
     async (args) => resultadoTexto(await facturasProveedores(args))
+  );
+
+  server.registerTool(
+    "ventasPorRutaCondicion",
+    {
+      description:
+        "Ventas por ruta desglosadas por condición de pago (CONTADO/CREDITO) — cruce entre ventasPorRuta/ventasPorGrupo (desglose por ruta) y ventasPorCondicionPago (desglose por condición), reutilizando EXACTAMENTE la misma lógica de clasificación que esta última para que ambas tools nunca se desalineen. Acepta exactamente uno de `ruta` (string o array de hasta 50, mismo patrón que ventasPorRuta — filtra por seller_code directo) o `grupo` (mismos valores que ventasPorGrupo — clasifica por CASE_GRUPO_*), nunca ambos ni ninguno. `categoria` opcional (mismos valores que ventasPorGrupo). Cada fila de `por_ruta` trae dolares_contado/dolares_credito/dolares_sin_dato/dolares_nota_credito (y su num_documentos correspondiente) — SIN_DATO es su propio bucket, NUNCA se fuerza a CREDITO cuando el cliente no tiene metodo_pago_cliente registrado (crítico para DOMICILIO, donde la mayoría de clientes no tienen ese campo poblado); dolares_totales siempre cuadra como la suma de los 4 buckets. IMPORTANTE (hallazgo encontrado al construir esta tool): CASE_GRUPO_FACTURAS/CASE_GRUPO_ORDENES clasifican como RURAL cualquier seller_code que empiece con 'R' — eso incluye sin querer 'RUTA 113'/'RUTA 131'/'RUTA 132'/'RUTA 132.1' (las rutas OK de ventasRutaOk), que son ~90% del monto que hoy sale bajo grupo=RURAL (~$2.72M vs ~$289K de rutas rurales genuinas R1-R6) — no se corrige acá (se reutiliza CASE_GRUPO_* tal cual, mismo principio de no reinventar), ver TODO.md. En modo `ruta`, si se pide exactamente 'RUTA 113'/'RUTA 131'/'RUTA 132' (no 'RUTA 132.1', comparte el mismo config de aqua-premium-ne que 'RUTA 132') se suma en vivo la venta de aqua-premium-ne a ese bucket CONTADO (confirmado con datos reales: 100% de esas ventas son en efectivo) — no aplica en modo `grupo`, aunque grupo=RURAL arrastre esas rutas por la colisión de arriba.",
+      inputSchema: schemaVentasPorRutaCondicion,
+    },
+    async (args) => resultadoTexto(await ventasPorRutaCondicion(args))
   );
 
   server.registerTool(
@@ -317,7 +341,18 @@ app.post("/mcp", exigirBearerToken, mcpPostHandler);
 app.get("/mcp", exigirBearerToken, mcpGetHandler);
 app.delete("/mcp", exigirBearerToken, mcpDeleteHandler);
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+// Commit/rama/fecha horneados en la imagen por el Dockerfile (ver
+// scripts/deploy.sh) — se lee una sola vez al arrancar. Si el archivo no
+// existe (ej. corriendo `node src/server.js` suelto fuera de Docker, sin
+// build), cae a "unknown" en vez de tumbar el arranque.
+let versionInfo = { commit: "unknown", branch: "unknown", build_date: "unknown" };
+try {
+  versionInfo = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "VERSION.json"), "utf8"));
+} catch {
+  // Sin VERSION.json (build local fuera de Docker) — se queda en "unknown".
+}
+
+app.get("/health", (_req, res) => res.json({ ok: true, version: versionInfo }));
 
 const PORT = Number(process.env.PORT) || 8787;
 app.listen(PORT, () => {
