@@ -3985,3 +3985,125 @@ tools actualizado a 14), `ventasRutaOk-real` (nuevo), y el resto de
 preexistente ya reportado (línea base "CD COMISARIATO", no relacionado a
 esta tool). Confirmado desplegado en el contenedor `mcp_server` en vivo
 (`grep` dentro del contenedor).
+
+## ✅ Fix: facturas del equipo Odoo "Domicilio" (+ suscripciones) invisibles en 'OTROS' — investigación de suscripciones/venta web (2026-09-29)
+
+### El pedido (usuario, investigación en 2 rondas antes de tocar código)
+
+Confirmar si el MCP/dashboard tiene visibilidad sobre (1) suscripciones con
+cobro recurrente vía débito bancario, y (2) ventas facturadas por la
+página web de Odoo (sospecha de que hoy caen mal dentro de DOMICILIO).
+Investigación pura primero (`Repórtame los hallazgos antes de tocar
+código`), decisión de alcance después de ver los números reales.
+
+### Ronda 1 — hallazgos (sin tocar código)
+
+- **Suscripciones**: sí existe el módulo (`sale_subscription`,
+  `website_sale_subscription`) en `grupoaqua.odoo.com` (misma instancia del
+  sync principal). En Odoo 16 vive integrado en `sale.order`
+  (`is_subscription`, `recurrence_id`) — `account.move` no tiene campo
+  propio, el vínculo se recupera por `invoice_origin`.
+- **Sí se sincronizan** a Postgres (verificado con muestra real: 10/10
+  facturas de suscripción existen en `facturas`) — el problema nunca fue de
+  sync, fue de clasificación: llegan con `seller_code=NULL` y
+  `equipo_ventas_nombre='Domicilio'` (equipo Odoo id=6 — **distinto** del
+  grupo DOMICILIO por seller_code A1-TA2), y ninguna rama de
+  `CASE_GRUPO_FACTURAS`/`CASE_GRUPO_ORDENES` matchea `seller_code=NULL`, así
+  que caían en `'OTROS'` (invisibles).
+- Montos reales (6 meses): suscripciones $2,268.97 (110 facturas), equipo
+  "Domicilio" completo $13,679.68 (710 facturas + 101 órdenes).
+- **Venta "Website"** (`equipo_ventas_nombre='Website'`, equipo Odoo
+  DISTINTO del anterior): 11,226 facturas ($617,674.30/6mo) también caían
+  en `'OTROS'` — a diferencia de las 10,592 `ordenes` con
+  `equipo_ventas='Website'`, que SÍ ya se contaban en DOMICILIO (rama UNION
+  existente).
+
+**Confirmado con el dueño del negocio** (fuera de esta investigación): la
+venta web real de la página desde 2023 es de solo $6,701.52 total — el
+equipo "Website" de Odoo se usa mal como default por algunas vendedoras,
+no representa venta real de la web. **Decisión: no crear grupo WEB.**
+
+### Ronda 2 — ¿hay que sumar las facturas Website a DOMICILIO también?
+
+**NO — hay doble conteo real, ya contado.** `facturas.invoice_origin`
+apunta directo al `sale.order` de origen y ese vínculo se sincroniza
+intacto a Postgres. Cruce en vivo (6 meses): de 10,253 facturas Website
+($541,134.37), **10,252 (99.99%) son la MISMA orden que ya está en
+`ordenes` con `equipo_ventas='Website'`** — mismo pedido en 2 etapas
+(pedido web → facturación), no 2 ventas. Desfase: 1 factura, $44.34.
+**No se toca nada de Website** — el número actual de DOMICILIO (solo vía
+`ordenes`) ya es correcto y completo.
+
+### Ronda 2 — ¿a qué grupo mapear el equipo "Domicilio" + suscripciones?
+
+Campo confiable encontrado: `clientes.codigo_tipo_negocio = 'DM-01'` =
+"DOMICILIO" en el catálogo real `tipos_negocio` (mismo patrón que
+`codigo_tipo_negocio='29'`→VIP, ya usado en el proyecto). Perfil real (6
+meses): 677 facturas, $13,637.70, 91% categoría SUSCRIPCION — clientes
+persona natural, `seller_code=NULL`, montos recurrentes ~$20.99/mes. Es
+agua a domicilio con débito recurrente: conceptualmente DOMICILIO, no un
+canal aparte ni un grupo artificial.
+
+**Hallazgo que definió el alcance del fix**: 1 orden de suscripción genera
+hasta 21 facturas mensuales (mismo contrato) — ejemplo real verificado:
+orden `S113727` de $20.99 → 21 facturas por $440.79 en total. Clasificar
+también `CASE_GRUPO_ORDENES` sumaría la orden-contrato ADEMÁS de sus
+facturas mensuales — doble conteo parcial (~$1,223 de $14,861 en la
+muestra). **El fix va SOLO en `CASE_GRUPO_FACTURAS`.**
+
+Caveat honesto, no forzado: ~32 de 147 clientes de este bucket tienen RUC
+de 13 dígitos (algunas genuinamente empresas, ej. razones sociales
+S.A./S.A.S., ~$1.5-2K estimado) mezclados con personas naturales con RUC
+"001...". No hay campo confiable para separarlos automáticamente —
+quedan clasificados como DOMICILIO también, no se inventó una regla débil
+basada en heurísticas de nombre para separarlos.
+
+### El fix
+
+En `mcp-server/src/sql/clasificacion.js`, `CASE_GRUPO_FACTURAS` únicamente
+(mismo precedente que la rama `equipo_ventas_nombre='Empresas'` ya
+existente):
+
+```sql
+WHEN f.equipo_ventas_nombre = 'Domicilio' THEN 'DOMICILIO'
+```
+
+`CASE_GRUPO_ORDENES` NO se toca (ver el hallazgo de doble conteo arriba).
+Confirmado 100% origen Odoo (0 casos MobilVendor en este bucket) — sin
+riesgo de colisión con el criterio de `seller_code`. Un solo punto de
+cambio se propaga automáticamente a `ventasPorGrupo`,
+`ventasPorCondicionPago`, `resumenDiario`, `clientesPorGrupo` — mismo
+mecanismo que RUTA_COMBINADA (Bug 1).
+
+### Validación con datos reales
+
+Rango cerrado 2026-03-01 a 2026-09-01 (meses completos): 729 facturas del
+equipo Odoo "Domicilio", $14,121.31, el 100% ahora clasifica como
+DOMICILIO (antes: 100% en `'OTROS'`). Confirmado que `CASE_GRUPO_ORDENES`
+sigue sin clasificar las 109 órdenes de este mismo equipo (evita el doble
+conteo del contrato + sus facturas mensuales). `ventasPorGrupo('DOMICILIO')`
+ya refleja el monto. Spot-check en `resumenDiario` (2026-09-02): incluye
+$188.91 de este bucket dentro del grupo DOMICILIO del día.
+
+Test nuevo: `mcp-server/test/clasificacionDomicilioEquipo-real.test.js`
+(`npm run test:clasificacion-domicilio-equipo-real`).
+
+### Validación técnica (suite completa, `node:20-alpine`, rama cortada de `main`)
+
+`seguridad-smoke-test` OK, `oauth-smoke-test` OK (14 tools, sin cambios —
+no se registra ninguna tool nueva), `ventasPorCondicionPago-real` OK,
+`preventa-real` OK, `ventasRutaOk-real` OK, `clientesSinVisita-real` OK, y
+el nuevo `clasificacionDomicilioEquipo-real` OK. `notasCredito-real` y
+`backlogPrevendedores-real` fallan por el mismo drift de datos/fecha
+preexistente ya conocido en esta suite (ninguno de los dos importa
+`CASE_GRUPO_FACTURAS`/`CASE_GRUPO_ORDENES` — confirmado con `grep`, no
+pueden verse afectados por este cambio).
+
+### Fuera de alcance, decisión explícita
+
+No se separan las ~32 cuentas de empresa mezcladas dentro del bucket
+(caveat de arriba) — no hay campo confiable, forzar una regla débil
+sería peor que dejarlas como DOMICILIO. No se toca nada de la venta
+"Website" (ronda 2, ya confirmado que el número actual es correcto). No se
+crea ningún grupo nuevo (SUSCRIPCION/WEB) — decisión explícita del dueño
+del negocio + del usuario.
