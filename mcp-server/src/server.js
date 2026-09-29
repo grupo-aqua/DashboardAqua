@@ -32,6 +32,7 @@ const { clientesSinConsumo, inputSchema: schemaClientesSinConsumo } = require(".
 const { clientesSinVisita, inputSchema: schemaClientesSinVisita } = require("./tools/clientesSinVisita");
 const { clientesVisitadosSinVenta, inputSchema: schemaClientesVisitadosSinVenta } = require("./tools/clientesVisitadosSinVenta");
 const { ventasPorCondicionPago, inputSchema: schemaVentasPorCondicionPago } = require("./tools/ventasPorCondicionPago");
+const { ventasPorRutaCondicion, inputSchema: schemaVentasPorRutaCondicion } = require("./tools/ventasPorRutaCondicion");
 const { backlogPrevendedores, inputSchema: schemaBacklogPrevendedores } = require("./tools/backlogPrevendedores");
 const { ventasRutaOk, inputSchema: schemaVentasRutaOk } = require("./tools/ventasRutaOk");
 const { facturasProveedores, inputSchema: schemaFacturasProveedores } = require("./tools/facturasProveedores");
@@ -191,6 +192,16 @@ function crearServer() {
       inputSchema: schemaFacturasProveedores,
     },
     async (args) => resultadoTexto(await facturasProveedores(args))
+  );
+
+  server.registerTool(
+    "ventasPorRutaCondicion",
+    {
+      description:
+        "Ventas por ruta desglosadas por condición de pago (CONTADO/CREDITO) — cruce entre ventasPorRuta/ventasPorGrupo (desglose por ruta) y ventasPorCondicionPago (desglose por condición), reutilizando EXACTAMENTE la misma lógica de clasificación que esta última para que ambas tools nunca se desalineen. Acepta exactamente uno de `ruta` (string o array de hasta 50, mismo patrón que ventasPorRuta — filtra por seller_code directo) o `grupo` (mismos valores que ventasPorGrupo — clasifica por CASE_GRUPO_*), nunca ambos ni ninguno. `categoria` opcional (mismos valores que ventasPorGrupo). Cada fila de `por_ruta` trae dolares_contado/dolares_credito/dolares_sin_dato/dolares_nota_credito (y su num_documentos correspondiente) — SIN_DATO es su propio bucket, NUNCA se fuerza a CREDITO cuando el cliente no tiene metodo_pago_cliente registrado (crítico para DOMICILIO, donde la mayoría de clientes no tienen ese campo poblado); dolares_totales siempre cuadra como la suma de los 4 buckets. IMPORTANTE (hallazgo encontrado al construir esta tool): CASE_GRUPO_FACTURAS/CASE_GRUPO_ORDENES clasifican como RURAL cualquier seller_code que empiece con 'R' — eso incluye sin querer 'RUTA 113'/'RUTA 131'/'RUTA 132'/'RUTA 132.1' (las rutas OK de ventasRutaOk), que son ~90% del monto que hoy sale bajo grupo=RURAL (~$2.72M vs ~$289K de rutas rurales genuinas R1-R6) — no se corrige acá (se reutiliza CASE_GRUPO_* tal cual, mismo principio de no reinventar), ver TODO.md. En modo `ruta`, si se pide exactamente 'RUTA 113'/'RUTA 131'/'RUTA 132' (no 'RUTA 132.1', comparte el mismo config de aqua-premium-ne que 'RUTA 132') se suma en vivo la venta de aqua-premium-ne a ese bucket CONTADO (confirmado con datos reales: 100% de esas ventas son en efectivo) — no aplica en modo `grupo`, aunque grupo=RURAL arrastre esas rutas por la colisión de arriba.",
+      inputSchema: schemaVentasPorRutaCondicion,
+    },
+    async (args) => resultadoTexto(await ventasPorRutaCondicion(args))
   );
 
   return server;
