@@ -19,7 +19,8 @@
     "test:facturas-proveedores-real": "node test/facturasProveedores-real.test.js",
     "test:ventas-por-ruta-condicion-real": "node test/ventasPorRutaCondicion-real.test.js",
     "test:clasificacion-ruta-combinada-real": "node test/clasificacionRutaCombinada-real.test.js",
-    "test:fallback-odoo-condicion-real": "node test/fallbackOdooCondicionPago-real.test.js"
+    "test:fallback-odoo-condicion-real": "node test/fallbackOdooCondicionPago-real.test.js",
+    "test:clasificacion-domicilio-equipo-real": "node test/clasificacionDomicilioEquipo-real.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",

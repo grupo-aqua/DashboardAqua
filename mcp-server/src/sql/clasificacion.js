@@ -95,9 +95,26 @@ const FILTRO_ORDENES_GRUPO_VALIDO = `
 // datos reales — ver TODO.md para los conteos completos (586 clientes Odoo +
 // 154 MobilVendor-facturas + 15 MobilVendor-ordenes, 617 tras excluir
 // códigos genéricos).
+//
+// CORRECCIÓN 2026-09-29 (pedido del usuario, investigación de suscripciones/
+// venta web): las facturas del equipo Odoo "Domicilio" (`equipo_ventas_nombre
+// = 'Domicilio'`, distinto del grupo DOMICILIO de seller_code A1-TA2 de
+// arriba) caían en 'OTROS' — invisibles. Confirmado con datos reales
+// (`clientes.codigo_tipo_negocio = 'DM-01'` = "DOMICILIO" en el catálogo
+// real, mismo patrón que '29'=VIP): 91% de este bucket son suscripciones de
+// agua a domicilio con débito recurrente (persona natural, ~$20.99/mes) —
+// venta real de DOMICILIO, no un canal aparte. SOLO en `facturas`, nunca en
+// `CASE_GRUPO_ORDENES`: 1 orden de suscripción genera hasta 21 facturas
+// mensuales (ejemplo real: orden $20.99 → 21 facturas por $440.79) — sumar
+// también la orden sería doble conteo del mismo contrato. 100% origen Odoo
+// (0 casos MobilVendor), sin riesgo de colisión de seller_code con la rama
+// de arriba. Investigación completa (incluida la venta "Website" que SÍ se
+// descartó por ser el mismo documento ya contado vía `ordenes` — ver
+// TODO.md) en TODO.md.
 const CASE_GRUPO_FACTURAS = `
   CASE
     WHEN f.seller_code IN ('A1','A2','A3','A4.1','A5','A6','A7','TA2') THEN 'DOMICILIO'
+    WHEN f.equipo_ventas_nombre = 'Domicilio' THEN 'DOMICILIO'
     WHEN f.seller_code IN ${SELLER_CODES_RUTA_COMBINADA_SQL} THEN 'RUTA_COMBINADA'
     WHEN f.seller_code ILIKE 'M%' THEN 'MAYORISTA'
     WHEN f.equipo_ventas_nombre = 'Empresas' THEN 'EMPRESAS'
