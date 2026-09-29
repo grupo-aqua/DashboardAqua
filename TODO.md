@@ -4459,3 +4459,31 @@ de un test con fecha hardcodeada (2026-09-15, ya fuera de la ventana de
 10 días del cron al día de hoy 2026-09-29) — confirmado con `git diff`
 que esta rama no toca ni `backlogPrevendedores.js` ni su test, mismo
 patrón que el drift ya conocido de `notasCredito-real.test.js`.
+
+## ✅ Despliegue combinado: + `ventasPorRutaCondicion` (2026-09-29)
+
+Autorizado explícitamente por el usuario ("Dale, apruebo. Mergea y
+despliega ventasPorRutaCondicion a producción"). `local/mcp-integracion`
+(que ya tenía `ventasRutaOk` + `facturasProveedores` + `auditoriaClientes`
+activas) recibió el merge de `feature/ventas-por-ruta-condicion` —
+conflictos en `TODO.md`/`package.json`/`server.js`/
+`seguridad-smoke-test.js`/`oauth-smoke-test.js` resueltos a mano (conteo
+de tools ajustado a 17 = 13 base + las 4).
+
+Suite completa (`node:20-alpine`) sin regresión: `seguridad-smoke-test`,
+`oauth-smoke-test` (17 tools confirmadas), y las 4 suites reales de las
+tools nuevas (`ventasRutaOk-real`, `facturasProveedores-real`,
+`auditoriaClientes-real`, `ventasPorRutaCondicion-real`) todas en verde a
+la vez, más `preventa-real`/`ventasPorCondicionPago-real`/
+`clientesSinVisita-real`/`mcp-session-recovery` sin regresión.
+`docker compose build mcp_server && up -d` desde esta rama (commit
+`38549b8`); confirmado con un `require()` real dentro del contenedor vivo
+que los 4 módulos cargan y exportan lo esperado, más `/health`
+respondiendo `{"ok":true}`.
+
+Nota: `main` sigue sin cambios (los 6 PRs siguen abiertos en GitHub
+pendientes de review real: `ventasRutaOk`, `facturasProveedores`,
+`investigacion-waybill-rutas-t`, `version-en-build`, `auditoriaClientes`,
+`ventasPorRutaCondicion`) — esta rama local sigue siendo puramente para
+producción mientras se resuelve el proceso de review en el repo
+(`grupo-aqua/DashboardAqua`, migrado el 2026-09-24).
