@@ -8,6 +8,8 @@
 // que delega el login real a Google y valida el dominio (hd).
 require("dotenv").config();
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 const express = require("express");
 const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { StreamableHTTPServerTransport } = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
@@ -33,6 +35,7 @@ const { ventasPorCondicionPago, inputSchema: schemaVentasPorCondicionPago } = re
 const { ventasPorRutaCondicion, inputSchema: schemaVentasPorRutaCondicion } = require("./tools/ventasPorRutaCondicion");
 const { backlogPrevendedores, inputSchema: schemaBacklogPrevendedores } = require("./tools/backlogPrevendedores");
 const { ventasRutaOk, inputSchema: schemaVentasRutaOk } = require("./tools/ventasRutaOk");
+const { facturasProveedores, inputSchema: schemaFacturasProveedores } = require("./tools/facturasProveedores");
 
 function resultadoTexto(objeto) {
   return { content: [{ type: "text", text: JSON.stringify(objeto, null, 2) }] };
@@ -182,6 +185,16 @@ function crearServer() {
   );
 
   server.registerTool(
+    "facturasProveedores",
+    {
+      description:
+        "Facturas y notas de crédito DE PROVEEDOR (compras, no ventas) en las 5 compañías del grupo — GRUPOAQUA, AQUASUPPLY, COTTSA, IIBC, DISTRINTER, todas en la misma instancia Odoo corporativa multi-compañía. `compania` acepta un alias o un array (default: las 5). `tipo_documento` ('FACTURA'/'NOTA_CREDITO') opcional para acotar; sin especificar trae ambos. Devuelve `documentos` crudos (compañía, proveedor+RUC, número de documento, referencia, tipo, fecha_factura, fecha_vencimiento, moneda, monto_total, monto_pagado, saldo_pendiente, estado, estado_pago, journal) limitados por `limite` (default 300, tope 1000, ordenados por fecha descendente) — más `total_general`, `por_compania`, `por_compania_y_mes` y `por_journal` (agregados en Odoo, no limitados por `limite`) y `por_proveedor` (top N según `top_n_proveedores`, default 20). IMPORTANTE: esta tool NO decide qué es 'gasto' ni filtra por devengado/pagado — expone estado y estado_pago crudos para que ese criterio se aplique después de leer el resultado. Único filtro fijo: se excluyen documentos state='cancel' (no son transacciones reales, Odoo mismo los excluye de sus propios reportes) — 'draft' y 'posted' SÍ se incluyen ambos, visibles vía `estado`. Consulta EN VIVO a Odoo en cada llamada (sin sincronización propia) — si Odoo no responde, falla explícito en vez de mostrar $0.",
+      inputSchema: schemaFacturasProveedores,
+    },
+    async (args) => resultadoTexto(await facturasProveedores(args))
+  );
+
+  server.registerTool(
     "ventasPorRutaCondicion",
     {
       description:
@@ -317,7 +330,18 @@ app.post("/mcp", exigirBearerToken, mcpPostHandler);
 app.get("/mcp", exigirBearerToken, mcpGetHandler);
 app.delete("/mcp", exigirBearerToken, mcpDeleteHandler);
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+// Commit/rama/fecha horneados en la imagen por el Dockerfile (ver
+// scripts/deploy.sh) — se lee una sola vez al arrancar. Si el archivo no
+// existe (ej. corriendo `node src/server.js` suelto fuera de Docker, sin
+// build), cae a "unknown" en vez de tumbar el arranque.
+let versionInfo = { commit: "unknown", branch: "unknown", build_date: "unknown" };
+try {
+  versionInfo = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "VERSION.json"), "utf8"));
+} catch {
+  // Sin VERSION.json (build local fuera de Docker) — se queda en "unknown".
+}
+
+app.get("/health", (_req, res) => res.json({ ok: true, version: versionInfo }));
 
 const PORT = Number(process.env.PORT) || 8787;
 app.listen(PORT, () => {

@@ -3717,6 +3717,173 @@ investigar empíricamente el vínculo orden→factura ANTES de construir nada.
   un objeto/acción distinta, no la estaríamos sincronizando. Queda como
   pregunta abierta para Alberto, de menor prioridad (no bloquea esta tool).
 
+### Seguimiento (2026-09-23): se investigó la pregunta abierta de arriba — sin hallazgo positivo, 3 hipótesis descartadas con datos reales
+
+Se probaron en vivo contra la API real de MobilVendor (login +
+`getInvoices`, mismo endpoint que usa el sync) y contra Postgres, las 3
+únicas fuentes de "estado" adicionales que existen en los datos a los que
+tenemos acceso, buscando la señal "Shipping/Terminated" que Alberto ve en
+la UI de MobilVendor para T5/T6/T9 y que no se refleja en nuestros datos:
+
+1. **`doc.process_status`** (campo del objeto de la orden en
+   `getInvoices`, DISTINTO de `doc.status` — confirmado que existe, no se
+   captura en `ordenes` hoy). Se tomaron 2 órdenes reales conocidas con
+   `status=3` en nuestra base (`PDT9-009785` T9 2026-09-17,
+   `PDT6-008565` T6 2026-09-17) y se buscaron por `code` en la respuesta
+   viva de MobilVendor para ese día exacto: **`process_status` = "0" en
+   ambas**, igual que en órdenes normales sin avanzar — no correlaciona
+   con el avance real. Descartado como la señal buscada.
+2. **`waybill`** (ya documentado arriba como casi vacío para T-routes) —
+   confirmado de nuevo en vivo para esas mismas 2 órdenes: `waybill: false`
+   en ambas pese a `status=3`. Sin cambios respecto al hallazgo original.
+3. **`detalles_rutas.estado`** (tabla de planificación de visitas por
+   ruta/semana/día/secuencia, sincronizada por
+   `syncRouteDetailsService.js` desde el schema `route_details` — un
+   candidato no considerado en la investigación original). Consultada
+   directamente en Postgres (rol `postgres`, `mcp_readonly` no tiene
+   grant sobre esta tabla): **solo toma valores 0/1** (123,747 en 0,
+   75,742 en 1) — un flag binario de plan activo/inactivo, no un estado de
+   despacho/entrega con granularidad tipo "Shipping/Terminated". Descartado.
+
+**Conclusión de este seguimiento**: no existe, en ninguna fuente a la que
+tenemos acceso hoy (API de MobilVendor vía `getInvoices`, ni la tabla de
+planificación de rutas), un campo que capture la señal "Shipping/Terminated"
+que Alberto ve en la UI para T5/T6/T9 con más granularidad que
+`ordenes.status`. La hipótesis más probable, sin forma de confirmarla con
+los datos actuales, es que esa etiqueta vive en un proceso interno de
+MobilVendor (posiblemente ligado al rol `DESPACHADOR` visto en el
+`user_role_code` de estas órdenes) sin un endpoint de API correspondiente
+que la exponga — o que exista un endpoint distinto no descubierto en esta
+pasada. **Sigue sin bloquear nada**: la decisión de usar `ordenes.status`
+directo para `backlogPrevendedores` (confirmada por Alberto, ver abajo)
+sigue siendo válida — esto solo confirma que no hay una fuente mejor
+disponible, no que la decisión tomada esté incompleta.
+
+### Segundo seguimiento (mismo día, 2026-09-23): Alberto encontró el reporte real — SÍ hay una fuente mejor, con matices importantes
+
+Alberto encontró y subió el reporte "guías de entrega" que faltaba
+(`ReporteDetallesGuia_28` a `_36`) — una entidad separada de `ordenes`,
+con código de guía propio (Waybill, formato `GU<ruta>-<número>`) y un
+"Estado de Despacho" (Shipping/Terminated). Dio 3 órdenes reales de T5
+para probar directo:
+
+| Orden | Guía | Estado real (reporte Alberto) |
+|---|---|---|
+| PDPV5-008065 | GUT5-000026 | Shipping |
+| PDPV5-009668 | GUT5-000029 | Terminated |
+| PDPV5-009699 | GUT5-000031 | Shipping |
+
+**1) `ordenes.waybill_code` en Postgres — SÍ está poblado, correcto para
+las 3** (no es un hueco de sync en el código de guía):
+
+```
+code           seller_code status waybill_code  waybill_status fecha_creacion
+PDPV5-008065   PV5         5      GUT5-000026   0              2026-04-16
+PDPV5-009668   PV5         5      GUT5-000029   0              2026-07-09
+PDPV5-009699   PV5         4      GUT5-000031   0              2026-07-09
+```
+
+(Nota: estos 3 códigos son ruta **PV5** en `seller_code`/`user_code` —
+PREVENTA VIP, no T5 "TIENDAS" — la ruta "T5" que menciona Alberto es el
+`vehicle_code`/nombre del despachador del waybill, ver más abajo; son
+canales distintos con el MISMO mecanismo de guía, la confusión de nombres
+es esperable dado que ambos aparecen como "T5" en distintos campos.)
+
+`waybill_status` = "0" en las 3 — correcto para 2 (Shipping) pero
+**incorrecto para PDPV5-009668** (debería ser "3"/Terminada). Esto ya es
+un hallazgo real, pero la causa NO es la que se sospechaba originalmente
+(un simple hueco de sync donde el dato nunca se captura) — ver el punto 2.
+
+**2) ¿Es un hueco real de sync, o el dato tampoco está en el origen?** —
+Se probó EN VIVO, hoy, contra MobilVendor (no contra un snapshot
+sincronizado) en dos fuentes independientes:
+
+- `getInvoices` (el mismo endpoint que ya sincronizamos) — el objeto
+  `waybill` embebido de las 3 órdenes muestra `status: "0"` en las 3,
+  **incluida PDPV5-009668 en vivo hoy** — el propio endpoint fuente que
+  usamos para sincronizar ya trae el dato desactualizado, esto DESCARTA
+  la hipótesis de que sea nuestro propio código de sync (la protección
+  `COALESCE` que nunca re-escribe `waybill_status`) la causa — aunque no
+  protegiéramos ese valor, seguiríamos sincronizando "0" porque el origen
+  mismo ya da "0".
+- **Entidad `waybills` dedicada — DESCUBIERTA en esta pasada, no estaba
+  en el índice de schemas ya revisado**: `action:"get", schema:"waybills"`
+  (9,567 registros, paginado, mismo patrón genérico que ya usa
+  `syncRouteDetailsService.js` para `routes`/`route_details` — nadie
+  había probado el schema `waybills` antes). Trae el waybill como entidad
+  propia (no embebida en la orden), con más campos (oficina, bodega,
+  vehículo, `c`/`u`/`c_by`/`u_by` de auditoría). Buscando los 3 códigos
+  ahí: **`status` = "0" en los 3 también**, mismo resultado que
+  `getInvoices`.
+- **`action:"getWaybills"` — segunda entidad DESCUBIERTA, acción
+  dedicada distinta del `get` genérico** (respuesta más rica:
+  `headers`+`invoices`+`details`+`details_by_invoices`, con datos de
+  oficina/bodega/vehículo). Mismos 3 códigos, mismo resultado: `status`
+  = "0" en los 3.
+
+**Dato clave que SÍ es nuevo y relevante**: el campo `status` de la
+entidad `waybills` (a diferencia de todo lo probado en el primer
+seguimiento) **SÍ varía de verdad a escala** — de los 9,567 waybills:
+3,773 en "0", **5,794 en "3"** (confirmado con el comentario ya existente
+en `models/orden.js`: `waybill_status "3" = guía terminada`). O sea, "3"
+SÍ es un valor real y alcanzable que la mayoría de guías sí llegan a
+tener — no es un campo muerto/constante. Pero **GUT5-000029
+específicamente nunca llegó a "3" en ninguna de las 2 fuentes probadas**,
+pese a que su `create_date` (2026-07-07) y `u`/última-actualización
+(2026-07-10) coinciden con la orden real y muestran que el registro SÍ
+fue tocado después de creado — solo que ese "touch" no actualizó
+`status`.
+
+**Conclusión**: SÍ es un hueco real (el dato no llega a "3" cuando
+debería), pero NO es un hueco de sincronización nuestro — es que ni
+`getInvoices` ni la entidad `waybills`/`getWaybills` (las 2 fuentes de la
+propia API que exponen este campo) tienen el valor correcto para esta
+guía puntual, consultado en vivo hoy. La fuente del "Shipping/Terminated"
+que ve Alberto en su reporte exportado, para ESTE caso concreto, no viene
+de ninguno de estos 2 caminos.
+
+**3) ¿Existe un endpoint de "reporte"/"guías" aparte del índice ya
+revisado?** — Se probaron ~20 combinaciones de `action`/`schema`
+plausibles. Resultado:
+
+- **`action:"getReports"` — acción real, DESCUBIERTA en esta pasada** —
+  devuelve una lista de 8 PLANTILLAS de reporte/impresión (definiciones
+  XML tipo FastReport, tal cual las usa el módulo de impresión de
+  MobilVendor): `FACTURA`, 2 formatos de factura POS, `Evaluación de
+  Cuentas por Pagar`, `Facturación Gráfica y Análisis de Notas de
+  Crédito`, `Reporte de Promociones Utilizadas`, `Resumen de Ventas`,
+  `Visualización de Diarios de Pagos`. **Ninguna es "ReporteDetallesGuia"
+  ni nada relacionado a guías/despacho** — descartado como la fuente.
+- El resto de variantes probadas (`getGuides`, `getDispatchReport`,
+  `report`, `export`, schemas `guides`/`shipments`/`dispatch`/
+  `waybill_history`/`waybill_status`/etc.) devuelven `error_code 403` o
+  "Schema not found" — no existen bajo esos nombres.
+
+**Hipótesis más probable, sin poder confirmarla más**: el "Estado de
+Despacho" del reporte de Alberto no se lee de un campo `status` plano —
+posiblemente se COMPUTA en el motor de reportes de MobilVendor a partir
+de una regla o de otra tabla no descubierta (ej. confirmación del
+conductor vía una app distinta, cierre de ruta/caja), o el reporte que
+Alberto subió se genera desde la UI web de MobilVendor con su propio
+backend de reportería — separado de este web-service JSON que sí
+alcanzamos con `session_id` — y no tiene equivalente API accesible con
+las credenciales actuales.
+
+**Sí hay una mejora concreta y accionable, aunque no resuelva el caso
+puntual de GUT5-000029**: la entidad `waybills`/`getWaybills` (nueva,
+nunca sincronizada) tiene MUCHA más variación real de `status` (0/3, casi
+40%/60% del total) que lo que hoy vive en `ordenes.waybill_status`
+(protegido por `COALESCE`, nunca se re-sincroniza tras la primera
+captura). Sincronizar esta entidad de forma independiente (tabla propia,
+no dentro del upsert de `ordenes`) probablemente destrabaría MUCHOS casos
+donde el estado sí avanzó a "3" después de la primera sync y hoy se ve
+"0" — no es la causa de este caso puntual, pero sí sería una mejora real
+del dato existente. **No se construyó nada todavía** — queda para que
+Alberto decida si vale la pena (requiere su confirmación: no sabemos si
+"status"="3" en `waybills` realmente equivale 1:1 a "Terminated" del
+reporte que él ve, dado que falló exactamente en el caso de prueba que
+dio).
+
 ### Decisión de Alberto (confirmada con datos reales antes de construir)
 
 Usar directamente `ordenes.status`: 2 = pendiente (nunca avanzó), cualquier
@@ -3877,6 +4044,40 @@ Suite completa (`node:20-alpine`) 7/7 OK (`seguridad-smoke-test`,
 `notasCredito-real.test.js` no se corrió, deriva de datos preexistente ya
 reportada aparte, sin relación a este fix.
 
+## ✅ Mejora (bonus, pedida sin urgencia): commit/rama horneados en la imagen de `mcp_server`
+
+Pedido explícito del usuario: "hornea el commit SHA en el build de las
+imágenes (LABEL o archivo VERSION) para no tener que reconstruir el
+estado del disco cada vez que alguien pregunta qué está corriendo" — hasta
+ahora, confirmar qué código corría en el contenedor vivo requería
+`docker exec mcp_server grep ...` + cruzar a mano contra `git log` del
+host (sin `git` instalado dentro de la imagen).
+
+**Implementado**: `mcp-server/Dockerfile` acepta `ARG GIT_COMMIT`/
+`GIT_BRANCH`/`BUILD_DATE` (default `"unknown"` si no se pasan — nunca
+rompe un build suelto), los graba como `LABEL` de la imagen y en un
+`/app/VERSION.json` horneado en el build. `docker-compose.yml` pasa esos
+build-args desde variables de entorno del shell (`${GIT_COMMIT:-unknown}`,
+etc.). `src/server.js` lee ese `VERSION.json` una sola vez al arrancar
+(con fallback a "unknown" si no existe, ej. corriendo `node
+src/server.js` suelto fuera de Docker) y lo expone en `GET /health` junto
+al `ok:true` de siempre. Nuevo `scripts/deploy-mcp-server.sh` (raíz del
+repo) calcula `GIT_COMMIT`/`GIT_BRANCH`/`BUILD_DATE` automáticamente desde
+`git` y corre `docker compose build/up mcp_server` — reemplaza el comando
+manual usado hasta ahora en cada deploy de esta sesión.
+
+Validado con un build standalone (`docker build --build-arg ...`, sin
+tocar el contenedor de producción — esta rama está cortada de `main`, no
+tiene `ventasRutaOk`/`facturasProveedores` todavía): `VERSION.json` dentro
+de la imagen con los valores correctos, contenedor de prueba levantado en
+un puerto aparte, `GET /health` devolviendo
+`{"ok":true,"version":{"commit":"...","branch":"chore/version-en-build","build_date":"..."}}`
+— contenedor e imagen de prueba eliminados después. `docker compose
+config` confirma que el `docker-compose.yml` sigue parseando bien con los
+nuevos `args`. NO se redesplegó `mcp_server` en producción con este
+cambio — es una mejora de observabilidad, no urgente (pedido explícito del
+usuario), pendiente de aplicarse la próxima vez que se reconstruya el
+contenedor real (o antes, si se pide).
 ## ✅ Nueva tool: `ventasRutaOk` — combinado COTTSA + aqua-premium-ne de las rutas "OK" (113/131/132), sin deduplicar todavía
 
 ### El pedido (gerencia, vía Alberto)
@@ -3985,6 +4186,114 @@ tools actualizado a 14), `ventasRutaOk-real` (nuevo), y el resto de
 preexistente ya reportado (línea base "CD COMISARIATO", no relacionado a
 esta tool). Confirmado desplegado en el contenedor `mcp_server` en vivo
 (`grep` dentro del contenedor).
+
+## ✅ Nueva tool: `facturasProveedores` — facturas/notas de crédito de PROVEEDOR, 5 compañías, Odoo corporativo en vivo
+
+### El pedido (Alberto)
+
+Facturas de proveedor (compras, no ventas) de las 5 compañías del grupo
+(GRUPOAQUA, AQUASUPPLY, COTTSA, IIBC, DISTRINTER), crudas — la tool no
+decide qué es "gasto" ni filtra devengado vs. pagado, solo expone
+estado/estado_pago/saldo para que el gerente arme su propio criterio.
+
+### Las 4 confirmaciones pedidas antes de construir (investigadas en vivo, no asumidas)
+
+1. **IDs de `res.company`** — confirmado con `res.company.search_read` en
+   vivo contra `grupoaqua.odoo.com`: 1=GRUPOAQUA S.A., 2=AQUASUPPLY S.A.,
+   3=COMPAÑIA DE TRADICION TROPICAL S.A. COTTSA, 4=IIBC S.A.,
+   5=DISTRIBUIDORA INTERNACIONAL DE ALIMENTOS S.A. DISTRINTER — las 5
+   confirmadas, sin sorpresas.
+2. **Usuario/API key de solo lectura** — NO se creó una key nueva: se
+   reutiliza la MISMA API key que ya usa
+   `backend/services/odooServicio/odooConexion.js` (`cia@aqua.com.ec` sobre
+   la misma instancia `grupoaqua.odoo.com`/`grupoaqua-16-0-9234323`, ya
+   usada hoy para el sync de ventas COTTSA) — confirmado en vivo antes de
+   construir que ya tiene acceso de lectura a `account.move` con
+   `move_type in_invoice/in_refund` y a `res.partner`/`res.company` en las 5
+   compañías. **Nota de trade-off, no bloqueante**: NO es una key de solo
+   lectura dedicada/limitada como pidió Alberto — es la misma cuenta
+   general de siempre, con el mismo alcance de confianza que ya tiene
+   `backend/.env`. Crear una key de accounting con permisos acotados
+   (`account.move` + `res.partner` + `account.account`/`account.journal`,
+   sin escritura) queda como mejora de hardening futura, a decidir después.
+   Copiada a `mcp-server/.env` bajo `ODOO_CONTABILIDAD_*` (mismos valores
+   que `backend/.env` `ODOO_*` — son dos `.env` independientes, si
+   `backend/.env` rota la key hay que actualizar acá también).
+3. **Volumen real, últimos 12 meses** (`read_group` por compañía y
+   `move_type`, `invoice_date >= 2025-09-22`, en vivo antes de
+   comprometerse):
+   | Compañía | in_invoice | in_refund | Total docs | Total $ (aprox) |
+   |---|---|---|---|---|
+   | GRUPOAQUA | 7,840 | 42 | 7,882 | $6.82M |
+   | COTTSA | 801 | 0 | 801 | $1.77M |
+   | AQUASUPPLY | 302 | 4 | 306 | $559K |
+   | DISTRINTER | 235 | 1 | 236 | $513K |
+   | IIBC | 206 | 1 | 207 | $168K |
+
+   ~9,432 documentos combinados en 12 meses. Un rango típico de mes/semana
+   por compañía es perfectamente viable en vivo; para rangos amplios (los
+   12 meses completos) los resúmenes (`por_compania`,
+   `por_compania_y_mes`, `por_proveedor`, `por_journal`) se calculan con
+   `read_group` (agregación del lado de Odoo, no trae cada fila a memoria)
+   — solo `documentos` (detalle crudo) respeta `limite` (default 300, tope
+   1000).
+4. **Moneda por compañía** — confirmado con `res.company.currency_id`: las
+   5 compañías facturan en USD, sin excepción. No hace falta conversión;
+   se expone `moneda` por documento de todos modos (defensivo).
+
+### Diseño
+
+`mcp-server/src/tools/facturasProveedores.js` + nuevo cliente JSON-RPC
+`mcp-server/src/integrations/odooContabilidad.js` (mismo patrón exacto que
+`aquaPremiumNe.js`: en vivo, sin caché, error explícito si Odoo no
+responde — nunca "$0" silencioso). `compania` acepta alias o array (default
+las 5); `tipo_documento` ('FACTURA'/'NOTA_CREDITO') opcional. Único filtro
+fijo, no configurable: se excluyen documentos `state='cancel'` (no son
+transacciones reales — el propio Odoo los excluye de sus reportes); 'draft'
+y 'posted' se incluyen ambos, visibles vía `estado`, sin que la tool decida
+por el usuario. Devuelve `total_general`, `por_compania`,
+`por_compania_y_mes`, `por_proveedor` (top N vía `top_n_proveedores`,
+default 20) y `por_journal` (agregados, no limitados) + `documentos`
+crudos (limitados por `limite`). Registrada en `server.js` (14ª tool sobre
+`main`).
+
+### Validación con datos reales
+
+Rango: 2026-09-01 a 2026-09-21 (actividad real confirmada en las 5
+compañías antes de escribir el test). Nuevo test
+`facturasProveedores-real.test.js`: cada compañía individual comparada
+contra un `read_group` **construido de forma independiente** en el test
+(domain armado a mano, sin reutilizar ninguna función interna de la tool,
+para no compartir un eventual bug de construcción de domain) — coincide
+exacto en documentos/monto_total/saldo_pendiente; `monto_pagado +
+saldo_pendiente == monto_total` en cada documento; ningún documento con
+`estado='cancel'`; para COTTSA (rango con pocos proveedores/1 journal)
+`por_proveedor`/`por_journal`/`documentos` suman exacto contra
+`total_general` (nada truncado); el array de las 5 compañías consolida
+exacto contra las 5 llamadas individuales; `por_compania_y_mes` coincide
+con `por_compania` para un rango de un solo mes; el default sin `compania`
+coincide con el array explícito; `tipo_documento='NOTA_CREDITO'` filtra
+correctamente y devolvió notas de crédito reales (GRUPOAQUA, rango
+2026-01-01 a 2026-09-21).
+
+Suite completa (`node:20-alpine`) sobre esta rama (cortada de `main`, sin
+el merge aún pendiente de `ventasRutaOk`): `seguridad-smoke-test` (payload
+de inyección en `compania`/`tipo_documento` rechazado por `z.enum` — esta
+tool no toca Postgres en absoluto, todo va a Odoo, así que no hay
+`pool.query` que proteger), `oauth-smoke-test` (conteo de tools 14),
+`facturasProveedores-real` (nuevo), y el resto de
+`*-real.test.js`/`mcp-session-recovery`/`diasFestivos-sync` sin regresión.
+
+### Pendiente — secuencia de despliegue (NO se rebuildeó `mcp_server` en esta tarea)
+
+El contenedor `mcp_server` en este momento corre el código de
+`feature/ventas-ruta-ok` (deployado en la tarea anterior, ver sección de
+`ventasRutaOk` arriba). Esta rama (`feature/facturas-proveedores`) se
+cortó de `main`, así que reconstruir `mcp_server` desde acá ahora
+mismo quitaría `ventasRutaOk` de producción sin aviso — se dejó
+explícitamente sin tocar el deploy, avisado al usuario. Cuando ambas ramas
+estén mergeadas a `main`, un solo rebuild desde `main` deja las dos tools
+activas a la vez.
 
 ## ✅ Nueva tool: `ventasPorRutaCondicion` — ventas por ruta desglosadas por condición de pago
 
