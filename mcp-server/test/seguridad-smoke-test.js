@@ -22,6 +22,7 @@ const { backlogPrevendedores, inputSchema: inputSchemaBacklogPrevendedores } = r
 const { inputSchema: inputSchemaVentasRutaOk, RUTAS_OK_VALIDAS } = require("../src/tools/ventasRutaOk");
 const { inputSchema: inputSchemaFacturasProveedores, COMPANIAS_VALIDAS } = require("../src/tools/facturasProveedores");
 const { ventasPorRutaCondicion, inputSchema: inputSchemaVentasPorRutaCondicion } = require("../src/tools/ventasPorRutaCondicion");
+const { inputSchema: inputSchemaAuditoriaClientes, CATEGORIAS_VALIDAS: CATEGORIAS_AUDITORIA_VALIDAS } = require("../src/tools/auditoriaClientes");
 const { pool } = require("../src/db");
 
 async function main() {
@@ -497,6 +498,37 @@ async function main() {
   }
   if (!fallóNinguno) throw new Error("FALLO: ventasPorRutaCondicion aceptó no pedir ni `ruta` ni `grupo`");
   console.log("OK: ventasPorRutaCondicion rechaza no pedir ni `ruta` ni `grupo`.");
+
+  // 19) auditoriaClientes (nuevo): sin superficie de inyección SQL en
+  //     absoluto — todo el SQL es texto estático, los únicos parámetros de
+  //     usuario son `categoria` (z.enum cerrado), `umbral_dias_inactividad`
+  //     y `limite` (ambos z.number().int(), zod ya rechaza cualquier string).
+  //     Se confirma que el enum rechaza un valor inválido y acepta las 5
+  //     categorías reales.
+  const schemaAuditoriaClientes = z.object(inputSchemaAuditoriaClientes);
+  const parseoAuditoriaCategoriaInvalida = schemaAuditoriaClientes.safeParse({ categoria: "DROP TABLE clientes" });
+  if (parseoAuditoriaCategoriaInvalida.success) throw new Error("FALLO: zod aceptó una categoria inválida en auditoriaClientes");
+  console.log("OK: zod rechazó una categoria inválida en auditoriaClientes ->", parseoAuditoriaCategoriaInvalida.error.issues[0].message);
+
+  for (const categoriaValida of CATEGORIAS_AUDITORIA_VALIDAS) {
+    const parseoValido = schemaAuditoriaClientes.safeParse({ categoria: categoriaValida });
+    if (!parseoValido.success) throw new Error(`FALLO: zod rechazó la categoria real "${categoriaValida}" en auditoriaClientes`);
+  }
+  console.log("OK: auditoriaClientes acepta las 5 categorías reales:", CATEGORIAS_AUDITORIA_VALIDAS.join(", "));
+
+  // Esta tool es de SOLO LECTURA por regla de fase 1 — confirmación
+  // estructural (no solo de comportamiento): el CÓDIGO real (sin
+  // comentarios, que sí mencionan estos verbos en prosa al explicar la
+  // regla) no debe contener ningún verbo de escritura SQL.
+  const fuenteAuditoria = require("fs")
+    .readFileSync(require("path").join(__dirname, "../src/tools/auditoriaClientes.js"), "utf8")
+    .split("\n")
+    .filter((linea) => !linea.trim().startsWith("//"))
+    .join("\n");
+  if (/\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE)\b/i.test(fuenteAuditoria)) {
+    throw new Error("FALLO: auditoriaClientes.js contiene un verbo de escritura SQL fuera de comentarios — viola la regla de fase 1 (solo lectura)");
+  }
+  console.log("OK: auditoriaClientes.js no contiene ningún verbo de escritura SQL fuera de comentarios (confirma la regla de fase 1: solo lectura).");
 
   await pool.end();
   console.log("\nSEGURIDAD SMOKE TEST OK");

@@ -36,6 +36,7 @@ const { ventasPorRutaCondicion, inputSchema: schemaVentasPorRutaCondicion } = re
 const { backlogPrevendedores, inputSchema: schemaBacklogPrevendedores } = require("./tools/backlogPrevendedores");
 const { ventasRutaOk, inputSchema: schemaVentasRutaOk } = require("./tools/ventasRutaOk");
 const { facturasProveedores, inputSchema: schemaFacturasProveedores } = require("./tools/facturasProveedores");
+const { auditoriaClientes, inputSchema: schemaAuditoriaClientes } = require("./tools/auditoriaClientes");
 
 function resultadoTexto(objeto) {
   return { content: [{ type: "text", text: JSON.stringify(objeto, null, 2) }] };
@@ -202,6 +203,16 @@ function crearServer() {
       inputSchema: schemaVentasPorRutaCondicion,
     },
     async (args) => resultadoTexto(await ventasPorRutaCondicion(args))
+  );
+
+  server.registerTool(
+    "auditoriaClientes",
+    {
+      description:
+        "FASE 1, SOLO DIAGNÓSTICO — audita calidad de datos de clientes cruzando MobilVendor (Postgres) y Odoo corporativo (grupoaqua.odoo.com, misma instancia de facturasProveedores). NUNCA escribe/corrige nada, solo señala para revisión humana — canal automático y corrección de coordenadas quedan para una Fase 2 futura no construida. Sin `categoria`: resumen de las 5 categorías con una muestra chica (5) de cada una. Con `categoria` ('direcciones_incompletas'|'coordenadas'|'duplicados'|'sin_canal'|'activos_sin_consumo'): listado completo de esa categoría hasta `limite` (default 50, tope 500). direcciones_incompletas = sin calle1 Y sin el fallback clientes.direccion_cliente (mismo campo que ya usa el resto del dashboard como dirección real). coordenadas = nula, (0,0), fuera del rango geográfico de Ecuador continental, o pin repetido idéntico en más de 5 clientes distintos (señal de pin por defecto). duplicados devuelve 2 listas separadas: senal_fuerte (mismo RUC+company_id+nombre EXACTO — duplicado real de maestro, mismo criterio ya validado en clientesSinConsumo) y senal_debil (mismo RUC, nombres distintos — puede ser duplicado real o sucursales legítimas de una cadena, requiere revisión caso por caso; los grupos de más de 8 nombres distintos se excluyen del listado por ser casi siempre cadenas grandes conocidas, el conteo de cuántos se excluyeron se informa aparte). sin_canal es MobilVendor-only (codigo_tipo_negocio IS NULL) — Odoo no tiene un campo de canal poblado de forma confiable (se investigaron 3 candidatos, los 3 casi vacíos). activos_sin_consumo cruza clientes marcados activos en Odoo (res.partner.active=true — la ÚNICA señal de 'activo' confiable encontrada; estado_cliente de MobilVendor NO sirve, en realidad guarda el status del último documento sincronizado, no una bandera de actividad) sin ninguna compra en más de `umbral_dias_inactividad` días (default 365) — clientes sin ningún match por RUC en Odoo se excluyen del listado de candidatos (no hay señal confiable de que estén activos) pero se cuentan aparte en sin_señal_confiable_de_activo.",
+      inputSchema: schemaAuditoriaClientes,
+    },
+    async (args) => resultadoTexto(await auditoriaClientes(args))
   );
 
   return server;

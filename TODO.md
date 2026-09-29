@@ -4546,6 +4546,140 @@ explícitamente sin tocar el deploy, avisado al usuario. Cuando ambas ramas
 estén mergeadas a `main`, un solo rebuild desde `main` deja las dos tools
 activas a la vez.
 
+## ✅ Nueva tool: `auditoriaClientes` — Fase 1, solo diagnóstico (MobilVendor + Odoo)
+
+### El pedido (Alberto)
+
+Auditoría de calidad de datos de clientes, cruzando MobilVendor y Odoo:
+direcciones incompletas, coordenadas mal puestas, clientes duplicados,
+clientes sin canal asignado, clientes "activos" sin consumo en mucho
+tiempo. Reglas no negociables de esta fase: sin escritura (solo lectura y
+reporte), duplicados nunca fusión automática, coordenadas nunca
+geocodificación automática — todo eso y "canal automático" quedan para una
+Fase 2 futura, NO construida acá.
+
+### Las 4 confirmaciones pedidas antes de construir (investigadas con datos reales)
+
+1. **Campos de `direcciones_clientes`** (19 columnas) — "dirección
+   incompleta" = sin `calle1_direccion_cliente` Y sin el fallback
+   `clientes.direccion_cliente` (220 casos reales) — se eligió `calle1`
+   porque es el campo que TODO el resto del codebase ya usa como
+   dirección real (`COALESCE(dc.calle1_direccion_cliente,
+   c.direccion_cliente)`, patrón repetido en
+   botellonesController/cotsaController/etc.), no un criterio inventado.
+   `referencia`/`telefono` faltan en 17%/27% de los casos — demasiado
+   común para ser señal de "incompleta" por sí solos, se exponen como
+   `campos_faltantes` informativo.
+2. **Misma instancia Odoo que `facturasProveedores`** — confirmado
+   (`grupoaqua.odoo.com`/`grupoaqua-16-0-9234323`, mismas credenciales
+   `ODOO_CONTABILIDAD_*`). PERO: `clientes.id_odoo` (el FK "oficial")
+   está poblado en solo 84 de 20,431 clientes (0.4% — nunca se escribe en
+   ningún flujo de sync de este repo, es un mecanismo aparte para un
+   subconjunto chico ligado a `estado='ENVIADO_ODOO'`, 86 casos). El
+   cruce real tiene que ser por RUC (`identificacion_cliente` ↔
+   `res.partner.vat`), igual que con aqua-premium-ne. Hallazgo aparte
+   (contexto, no una de las 5 categorías pedidas): 983 partners activos
+   en Odoo no tienen NINGUNA fila en `clientes` por RUC — hueco de
+   cobertura real, reportado pero no auditado en esta fase.
+3. **"Activo" y "canal"** — investigado campo por campo:
+   - `clientes.estado_cliente` (int) NO es un flag de actividad —
+     `syncCliente` lo llena con `doc.status`, que es el status de la
+     ORDEN/FACTURA que disparó el sync, no del cliente. Confirmado con la
+     distribución real: toma los mismos valores (0-5) que `ordenes.status`.
+     Inservible para esta auditoría.
+   - `clientes.estado` (varchar) vacío en 20,345 de 20,431; el único
+     valor real es "ENVIADO_ODOO" (86 casos). Tampoco sirve.
+   - `clientes.estado_proceso_cliente` es constante en 0 para TODOS —
+     campo muerto (mismo patrón que `process_status` en otras entidades
+     de MobilVendor ya encontrado esta sesión).
+   - `res.partner.active` (Odoo, NATIVO) SÍ es real y masivo: de 23,282
+     partners con `customer_rank>0`, 8,587 (37%) archivados. Es la ÚNICA
+     señal de "activo" confiable encontrada. Se probaron 3 candidatos
+     custom de Odoo que sonaban prometedores
+     (`x_studio_tipo_cliente`/`x_studio_activos`/`channel_ids`) — los 3
+     casi vacíos (0/2,926/174 de 23,282) y `x_studio_activos` resultó ser
+     un código de bodega ("RB600"), no un booleano — descartados.
+   - "Canal" SOLO vive de forma confiable en MobilVendor
+     (`clientes.codigo_tipo_negocio`, de `business_type_code`) —
+     confirmado que Odoo no tiene equivalente poblado (mismos 3 campos
+     custom de arriba, revisados también para esto). `sin_canal` es por
+     eso un check MobilVendor-only, documentado así explícitamente en vez
+     de simular un cruce con Odoo que no existe.
+4. **Clave de duplicados**: `identificacion_cliente`. Formato mayormente
+   sano (10 dígitos cédula / 13 RUC, 99.75% de 20,308 valores no vacíos),
+   sin problema sistemático de ceros a la izquierda — sí hay ~49 registros
+   con longitud atípica, ruido real reportado aparte. **Hallazgo crítico,
+   conecta directo con el TODO existente "auditoría de duplicados por RUC
+   en todo el maestro de clientes"**: un RUC repetido NO siempre es
+   duplicado — confirmado con datos reales que RUCs de cadenas como TIA o
+   MINI MARKET se repiten 100-466 veces entre SUCURSALES legítimas con
+   nombres DISTINTOS (mismo patrón ya documentado y explícitamente NO
+   auditado en ese TODO). Por eso se separan 2 señales: FUERTE (mismo RUC
+   + `company_id` + nombre EXACTO — mismo criterio ya validado en
+   `clientesSinConsumo`) y DÉBIL (mismo RUC, nombres distintos —
+   requiere revisión caso por caso; se excluyen del LISTADO, no del
+   total, los grupos de más de 8 nombres distintos por ser casi siempre
+   cadenas grandes conocidas).
+
+**Esta investigación YA responde, a escala completa, el TODO pendiente**
+("Auditoría de duplicados por RUC en todo el maestro de clientes"): señal
+fuerte = **972 duplicados reales de maestro** en los 20,431 clientes
+(vs. los 5 confirmados originalmente solo en el universo chico de
+EMPRESAS, 617 clientes) — dimensiona el problema real que ese TODO pedía
+cuantificar. Señal débil (informativa, no todos son error) = 514 grupos
+con RUC compartido y nombres distintos, de los cuales 40 son cadenas
+grandes (más de 8 sucursales) excluidas del listado por ruido.
+
+### Diseño implementado
+
+`mcp-server/src/tools/auditoriaClientes.js` + reutiliza
+`src/integrations/odooContabilidad.js` (mismo cliente JSON-RPC que
+`facturasProveedores`, ya construido). Sin `categoria`: resumen de las 5
+con muestra chica (5) de cada una. Con `categoria`: listado completo hasta
+`limite` (default 50, tope 500). `activos_sin_consumo` acepta
+`umbral_dias_inactividad` (default 365) — clientes sin ningún match por
+RUC en Odoo se excluyen del listado de candidatos (no hay señal confiable
+de que estén activos) pero se cuentan aparte en
+`sin_señal_confiable_de_activo` (784 casos).
+
+**Bug real encontrado y corregido ANTES de entregar** (validación con SQL
+independiente, no solo "se ve bien"): `duplicados.senal_debil.total`
+devolvía el conteo YA FILTRADO (después de excluir cadenas grandes, 474)
+en vez del total real (514) — el campo `total` y
+`cadenas_grandes_excluidas_del_listado` deben ser independientes
+(514 total, 40 excluidas del listado, no 474+40). Corregido antes de
+mergear nada.
+
+Registrada en `server.js` (15ª tool sobre esta rama — 13 base +
+`facturasProveedores` + `auditoriaClientes`; `ventasRutaOk` vive en una
+rama hermana todavía sin mergear).
+
+### Validación con datos reales
+
+Cada categoría comparada contra SQL/JSON-RPC construido de forma
+INDEPENDIENTE en el test (no reutiliza ninguna función interna de la
+tool): `direcciones_incompletas` (136), `duplicados.senal_fuerte` (972),
+`duplicados.senal_debil` (514, tras el fix del bug de arriba), `sin_canal`
+(9,496) — coincidencia exacta en los 4. `coordenadas`: verificado que el
+cluster de pin por defecto conocido
+(`-1.3397668,-79.3666965`, 60+ clientes reales) se clasifica
+`PIN_POR_DEFECTO`. `activos_sin_consumo`: caso real conocido (TIA CUMBAYA,
+código 137500, confirmado con 0 filas en `ordenes`/`facturas` bajo su
+propio código) aparece con `nunca_compro=true` cuando su RUC está activo
+en Odoo (verificado en vivo, no asumido); monotonía correcta del umbral
+(180 días ⊇ 365 ⊇ 730). Resumen sin `categoria` coincide exacto contra las
+llamadas por categoría individual.
+
+Suite completa (`node:20-alpine`): `seguridad-smoke-test` (sin superficie
+de inyección SQL — todo el SQL es texto estático, más una confirmación
+ESTRUCTURAL nueva de que el archivo fuente no contiene ningún verbo de
+escritura SQL fuera de comentarios, validando la regla de "sin escritura"
+de fase 1 directamente sobre el código, no solo por comportamiento),
+`oauth-smoke-test` (conteo de tools 15), `auditoriaClientes-real` (nuevo),
+y el resto de `*-real.test.js`/`mcp-session-recovery`/`diasFestivos-sync`
+sin regresión.
+
+
 ## ✅ Nueva tool: `ventasPorRutaCondicion` — ventas por ruta desglosadas por condición de pago
 
 ### El pedido
