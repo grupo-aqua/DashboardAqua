@@ -210,7 +210,7 @@ async function main() {
   });
   await mcpClient.connect(mcpTransport);
   const { tools } = await mcpClient.listTools();
-  asegurar(tools.length === 14, `listTools() con Bearer token devuelve las 14 tools (llegaron ${tools.length})`);
+  asegurar(tools.length === 15, `listTools() con Bearer token devuelve las 15 tools (llegaron ${tools.length})`);
   const resultadoTool = await mcpClient.callTool({
     name: "resumenDiario",
     arguments: { fecha: new Date(Date.now() - 86400000).toISOString().slice(0, 10) },
