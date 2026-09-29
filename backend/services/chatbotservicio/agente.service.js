@@ -61,7 +61,8 @@ Los CANALES de venta se identifican por el prefijo del route_code o seller_code:
 - EMPRESAS   → seller_code ILIKE 'E%'
 - MAYORISTA  → seller_code ILIKE 'M%'
 - QUITO      → seller_code = 'U1'
-- RURAL      → seller_code ILIKE 'R%'
+- RUTA_COMBINADA → seller_code IN ('RUTA 113','RUTA 131','RUTA 132','RUTA 132.1') — rutas "OK", canal propio, DISTINTO de RURAL aunque el código empiece con 'R' de "RUTA". Para el detalle completo (incluye una segunda fuente externa, aqua-premium-ne) usar la tool ventasRutaOk, no este canal genérico.
+- RURAL      → seller_code ILIKE 'R%' Y NO empieza con 'RUTA ' (si no, se cuentan sin querer las 4 rutas de RUTA_COMBINADA — corregido 2026-09-29, antes ese error inflaba RURAL ~10x)
 - TIENDAS    → seller_code ILIKE 'T%' AND seller_code NOT ILIKE 'TV%'
 - TIENDAS_VIP→ seller_code ILIKE 'TV%'
 - VIP        → seller_code ILIKE 'V%'  (en contexto botellón también codigo_tipo_negocio = '29')
