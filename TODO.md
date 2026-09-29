@@ -3717,6 +3717,173 @@ investigar empíricamente el vínculo orden→factura ANTES de construir nada.
   un objeto/acción distinta, no la estaríamos sincronizando. Queda como
   pregunta abierta para Alberto, de menor prioridad (no bloquea esta tool).
 
+### Seguimiento (2026-09-23): se investigó la pregunta abierta de arriba — sin hallazgo positivo, 3 hipótesis descartadas con datos reales
+
+Se probaron en vivo contra la API real de MobilVendor (login +
+`getInvoices`, mismo endpoint que usa el sync) y contra Postgres, las 3
+únicas fuentes de "estado" adicionales que existen en los datos a los que
+tenemos acceso, buscando la señal "Shipping/Terminated" que Alberto ve en
+la UI de MobilVendor para T5/T6/T9 y que no se refleja en nuestros datos:
+
+1. **`doc.process_status`** (campo del objeto de la orden en
+   `getInvoices`, DISTINTO de `doc.status` — confirmado que existe, no se
+   captura en `ordenes` hoy). Se tomaron 2 órdenes reales conocidas con
+   `status=3` en nuestra base (`PDT9-009785` T9 2026-09-17,
+   `PDT6-008565` T6 2026-09-17) y se buscaron por `code` en la respuesta
+   viva de MobilVendor para ese día exacto: **`process_status` = "0" en
+   ambas**, igual que en órdenes normales sin avanzar — no correlaciona
+   con el avance real. Descartado como la señal buscada.
+2. **`waybill`** (ya documentado arriba como casi vacío para T-routes) —
+   confirmado de nuevo en vivo para esas mismas 2 órdenes: `waybill: false`
+   en ambas pese a `status=3`. Sin cambios respecto al hallazgo original.
+3. **`detalles_rutas.estado`** (tabla de planificación de visitas por
+   ruta/semana/día/secuencia, sincronizada por
+   `syncRouteDetailsService.js` desde el schema `route_details` — un
+   candidato no considerado en la investigación original). Consultada
+   directamente en Postgres (rol `postgres`, `mcp_readonly` no tiene
+   grant sobre esta tabla): **solo toma valores 0/1** (123,747 en 0,
+   75,742 en 1) — un flag binario de plan activo/inactivo, no un estado de
+   despacho/entrega con granularidad tipo "Shipping/Terminated". Descartado.
+
+**Conclusión de este seguimiento**: no existe, en ninguna fuente a la que
+tenemos acceso hoy (API de MobilVendor vía `getInvoices`, ni la tabla de
+planificación de rutas), un campo que capture la señal "Shipping/Terminated"
+que Alberto ve en la UI para T5/T6/T9 con más granularidad que
+`ordenes.status`. La hipótesis más probable, sin forma de confirmarla con
+los datos actuales, es que esa etiqueta vive en un proceso interno de
+MobilVendor (posiblemente ligado al rol `DESPACHADOR` visto en el
+`user_role_code` de estas órdenes) sin un endpoint de API correspondiente
+que la exponga — o que exista un endpoint distinto no descubierto en esta
+pasada. **Sigue sin bloquear nada**: la decisión de usar `ordenes.status`
+directo para `backlogPrevendedores` (confirmada por Alberto, ver abajo)
+sigue siendo válida — esto solo confirma que no hay una fuente mejor
+disponible, no que la decisión tomada esté incompleta.
+
+### Segundo seguimiento (mismo día, 2026-09-23): Alberto encontró el reporte real — SÍ hay una fuente mejor, con matices importantes
+
+Alberto encontró y subió el reporte "guías de entrega" que faltaba
+(`ReporteDetallesGuia_28` a `_36`) — una entidad separada de `ordenes`,
+con código de guía propio (Waybill, formato `GU<ruta>-<número>`) y un
+"Estado de Despacho" (Shipping/Terminated). Dio 3 órdenes reales de T5
+para probar directo:
+
+| Orden | Guía | Estado real (reporte Alberto) |
+|---|---|---|
+| PDPV5-008065 | GUT5-000026 | Shipping |
+| PDPV5-009668 | GUT5-000029 | Terminated |
+| PDPV5-009699 | GUT5-000031 | Shipping |
+
+**1) `ordenes.waybill_code` en Postgres — SÍ está poblado, correcto para
+las 3** (no es un hueco de sync en el código de guía):
+
+```
+code           seller_code status waybill_code  waybill_status fecha_creacion
+PDPV5-008065   PV5         5      GUT5-000026   0              2026-04-16
+PDPV5-009668   PV5         5      GUT5-000029   0              2026-07-09
+PDPV5-009699   PV5         4      GUT5-000031   0              2026-07-09
+```
+
+(Nota: estos 3 códigos son ruta **PV5** en `seller_code`/`user_code` —
+PREVENTA VIP, no T5 "TIENDAS" — la ruta "T5" que menciona Alberto es el
+`vehicle_code`/nombre del despachador del waybill, ver más abajo; son
+canales distintos con el MISMO mecanismo de guía, la confusión de nombres
+es esperable dado que ambos aparecen como "T5" en distintos campos.)
+
+`waybill_status` = "0" en las 3 — correcto para 2 (Shipping) pero
+**incorrecto para PDPV5-009668** (debería ser "3"/Terminada). Esto ya es
+un hallazgo real, pero la causa NO es la que se sospechaba originalmente
+(un simple hueco de sync donde el dato nunca se captura) — ver el punto 2.
+
+**2) ¿Es un hueco real de sync, o el dato tampoco está en el origen?** —
+Se probó EN VIVO, hoy, contra MobilVendor (no contra un snapshot
+sincronizado) en dos fuentes independientes:
+
+- `getInvoices` (el mismo endpoint que ya sincronizamos) — el objeto
+  `waybill` embebido de las 3 órdenes muestra `status: "0"` en las 3,
+  **incluida PDPV5-009668 en vivo hoy** — el propio endpoint fuente que
+  usamos para sincronizar ya trae el dato desactualizado, esto DESCARTA
+  la hipótesis de que sea nuestro propio código de sync (la protección
+  `COALESCE` que nunca re-escribe `waybill_status`) la causa — aunque no
+  protegiéramos ese valor, seguiríamos sincronizando "0" porque el origen
+  mismo ya da "0".
+- **Entidad `waybills` dedicada — DESCUBIERTA en esta pasada, no estaba
+  en el índice de schemas ya revisado**: `action:"get", schema:"waybills"`
+  (9,567 registros, paginado, mismo patrón genérico que ya usa
+  `syncRouteDetailsService.js` para `routes`/`route_details` — nadie
+  había probado el schema `waybills` antes). Trae el waybill como entidad
+  propia (no embebida en la orden), con más campos (oficina, bodega,
+  vehículo, `c`/`u`/`c_by`/`u_by` de auditoría). Buscando los 3 códigos
+  ahí: **`status` = "0" en los 3 también**, mismo resultado que
+  `getInvoices`.
+- **`action:"getWaybills"` — segunda entidad DESCUBIERTA, acción
+  dedicada distinta del `get` genérico** (respuesta más rica:
+  `headers`+`invoices`+`details`+`details_by_invoices`, con datos de
+  oficina/bodega/vehículo). Mismos 3 códigos, mismo resultado: `status`
+  = "0" en los 3.
+
+**Dato clave que SÍ es nuevo y relevante**: el campo `status` de la
+entidad `waybills` (a diferencia de todo lo probado en el primer
+seguimiento) **SÍ varía de verdad a escala** — de los 9,567 waybills:
+3,773 en "0", **5,794 en "3"** (confirmado con el comentario ya existente
+en `models/orden.js`: `waybill_status "3" = guía terminada`). O sea, "3"
+SÍ es un valor real y alcanzable que la mayoría de guías sí llegan a
+tener — no es un campo muerto/constante. Pero **GUT5-000029
+específicamente nunca llegó a "3" en ninguna de las 2 fuentes probadas**,
+pese a que su `create_date` (2026-07-07) y `u`/última-actualización
+(2026-07-10) coinciden con la orden real y muestran que el registro SÍ
+fue tocado después de creado — solo que ese "touch" no actualizó
+`status`.
+
+**Conclusión**: SÍ es un hueco real (el dato no llega a "3" cuando
+debería), pero NO es un hueco de sincronización nuestro — es que ni
+`getInvoices` ni la entidad `waybills`/`getWaybills` (las 2 fuentes de la
+propia API que exponen este campo) tienen el valor correcto para esta
+guía puntual, consultado en vivo hoy. La fuente del "Shipping/Terminated"
+que ve Alberto en su reporte exportado, para ESTE caso concreto, no viene
+de ninguno de estos 2 caminos.
+
+**3) ¿Existe un endpoint de "reporte"/"guías" aparte del índice ya
+revisado?** — Se probaron ~20 combinaciones de `action`/`schema`
+plausibles. Resultado:
+
+- **`action:"getReports"` — acción real, DESCUBIERTA en esta pasada** —
+  devuelve una lista de 8 PLANTILLAS de reporte/impresión (definiciones
+  XML tipo FastReport, tal cual las usa el módulo de impresión de
+  MobilVendor): `FACTURA`, 2 formatos de factura POS, `Evaluación de
+  Cuentas por Pagar`, `Facturación Gráfica y Análisis de Notas de
+  Crédito`, `Reporte de Promociones Utilizadas`, `Resumen de Ventas`,
+  `Visualización de Diarios de Pagos`. **Ninguna es "ReporteDetallesGuia"
+  ni nada relacionado a guías/despacho** — descartado como la fuente.
+- El resto de variantes probadas (`getGuides`, `getDispatchReport`,
+  `report`, `export`, schemas `guides`/`shipments`/`dispatch`/
+  `waybill_history`/`waybill_status`/etc.) devuelven `error_code 403` o
+  "Schema not found" — no existen bajo esos nombres.
+
+**Hipótesis más probable, sin poder confirmarla más**: el "Estado de
+Despacho" del reporte de Alberto no se lee de un campo `status` plano —
+posiblemente se COMPUTA en el motor de reportes de MobilVendor a partir
+de una regla o de otra tabla no descubierta (ej. confirmación del
+conductor vía una app distinta, cierre de ruta/caja), o el reporte que
+Alberto subió se genera desde la UI web de MobilVendor con su propio
+backend de reportería — separado de este web-service JSON que sí
+alcanzamos con `session_id` — y no tiene equivalente API accesible con
+las credenciales actuales.
+
+**Sí hay una mejora concreta y accionable, aunque no resuelva el caso
+puntual de GUT5-000029**: la entidad `waybills`/`getWaybills` (nueva,
+nunca sincronizada) tiene MUCHA más variación real de `status` (0/3, casi
+40%/60% del total) que lo que hoy vive en `ordenes.waybill_status`
+(protegido por `COALESCE`, nunca se re-sincroniza tras la primera
+captura). Sincronizar esta entidad de forma independiente (tabla propia,
+no dentro del upsert de `ordenes`) probablemente destrabaría MUCHOS casos
+donde el estado sí avanzó a "3" después de la primera sync y hoy se ve
+"0" — no es la causa de este caso puntual, pero sí sería una mejora real
+del dato existente. **No se construyó nada todavía** — queda para que
+Alberto decida si vale la pena (requiere su confirmación: no sabemos si
+"status"="3" en `waybills` realmente equivale 1:1 a "Terminated" del
+reporte que él ve, dado que falló exactamente en el caso de prueba que
+dio).
+
 ### Decisión de Alberto (confirmada con datos reales antes de construir)
 
 Usar directamente `ordenes.status`: 2 = pendiente (nunca avanzó), cualquier
@@ -3988,3 +4155,435 @@ se logró: esos 3 dashboards ya NO cuentan (ni dormido ni en vivo) estas
 4 rutas como RURAL — el bug de raíz está cerrado en las 5 ubicaciones.
 Si se quiere que `RUTA_COMBINADA` aparezca como su propia tarjeta en
 alguno de esos dashboards, es una tarea aparte.
+
+### Integración con `ventasPorRutaCondicion` (encontrada al mergear a `main`, 2026-09-29)
+
+`ventasPorRutaCondicion.js` no existía todavía cuando este fix se
+construyó (rama cortada antes), así que nunca se probaron juntos hasta el
+merge a `main`. Su test (`ventasPorRutaCondicion-real.test.js`) tenía una
+aserción que confirmaba el hallazgo VIEJO como comportamiento esperado
+("grupo=RURAL SÍ mezcla las rutas OK, no se corrige acá") — con este fix
+ya en `main`, esa aserción quedó obsoleta y el test falló al mergear.
+Corregida: ahora confirma que `grupo=RURAL` ya NO mezcla las 4 rutas y que
+`grupo=RUTA_COMBINADA` sí las trae — la tool reutiliza
+`CASE_GRUPO_FACTURAS`/`CASE_GRUPO_ORDENES` tal cual, así que el fix se
+propagó automáticamente sin tocar su código propio, solo el test
+necesitaba actualizarse.
+
+## ✅ Mejora (bonus, pedida sin urgencia): commit/rama horneados en la imagen de `mcp_server`
+
+Pedido explícito del usuario: "hornea el commit SHA en el build de las
+imágenes (LABEL o archivo VERSION) para no tener que reconstruir el
+estado del disco cada vez que alguien pregunta qué está corriendo" — hasta
+ahora, confirmar qué código corría en el contenedor vivo requería
+`docker exec mcp_server grep ...` + cruzar a mano contra `git log` del
+host (sin `git` instalado dentro de la imagen).
+
+**Implementado**: `mcp-server/Dockerfile` acepta `ARG GIT_COMMIT`/
+`GIT_BRANCH`/`BUILD_DATE` (default `"unknown"` si no se pasan — nunca
+rompe un build suelto), los graba como `LABEL` de la imagen y en un
+`/app/VERSION.json` horneado en el build. `docker-compose.yml` pasa esos
+build-args desde variables de entorno del shell (`${GIT_COMMIT:-unknown}`,
+etc.). `src/server.js` lee ese `VERSION.json` una sola vez al arrancar
+(con fallback a "unknown" si no existe, ej. corriendo `node
+src/server.js` suelto fuera de Docker) y lo expone en `GET /health` junto
+al `ok:true` de siempre. Nuevo `scripts/deploy-mcp-server.sh` (raíz del
+repo) calcula `GIT_COMMIT`/`GIT_BRANCH`/`BUILD_DATE` automáticamente desde
+`git` y corre `docker compose build/up mcp_server` — reemplaza el comando
+manual usado hasta ahora en cada deploy de esta sesión.
+
+Validado con un build standalone (`docker build --build-arg ...`, sin
+tocar el contenedor de producción — esta rama está cortada de `main`, no
+tiene `ventasRutaOk`/`facturasProveedores` todavía): `VERSION.json` dentro
+de la imagen con los valores correctos, contenedor de prueba levantado en
+un puerto aparte, `GET /health` devolviendo
+`{"ok":true,"version":{"commit":"...","branch":"chore/version-en-build","build_date":"..."}}`
+— contenedor e imagen de prueba eliminados después. `docker compose
+config` confirma que el `docker-compose.yml` sigue parseando bien con los
+nuevos `args`. NO se redesplegó `mcp_server` en producción con este
+cambio — es una mejora de observabilidad, no urgente (pedido explícito del
+usuario), pendiente de aplicarse la próxima vez que se reconstruya el
+contenedor real (o antes, si se pide).
+## ✅ Nueva tool: `ventasRutaOk` — combinado COTTSA + aqua-premium-ne de las rutas "OK" (113/131/132), sin deduplicar todavía
+
+### El pedido (gerencia, vía Alberto)
+
+Rutas "OK" (113, 131, 132) venden en dos sistemas Odoo distintos:
+COTTSA (ya sincronizado en `ventas_mv`, factura formalmente al SRI) y una
+segunda instancia separada, **aqua-premium-ne**
+(`https://aqua-premium-ne.odoo.com`), donde las mismas rutas registran
+ventas que NO se facturan formalmente ahí (quedan como `pos.order` — Punto
+de Venta, notas de entrega, no `sale.order`: ese módulo no está instalado
+en esa instancia). El gerente quiere ver el total vendido de OK = suma de
+ambas fuentes, con opción de desglosar por facturado (COTTSA) vs. no
+facturado (aqua-premium-ne).
+
+### Investigación previa (antes de construir nada, pedido explícito)
+
+- **Conexión**: JSON-RPC (`common.authenticate` + `object.execute_kw`,
+  endpoint `POST /jsonrpc`) — funciona igual que XML-RPC en Odoo Online
+  aunque no sea plan enterprise; se prefirió JSON-RPC para no agregar una
+  dependencia nueva (Node ya trae `fetch`). Odoo devuelve HTTP 200 incluso
+  en errores de auth/permisos — el error real va en un campo `.error` del
+  body, hay que chequearlo explícito (no solo el status HTTP). Cliente
+  nuevo: `mcp-server/src/integrations/aquaPremiumNe.js` — llamada EN VIVO
+  sin caché, con propagación explícita de errores de red/timeout/auth
+  (nunca "$0" silencioso si la instancia no responde).
+- **"Ruta" en aqua-premium-ne** = el Punto de Venta (`pos.config.name`):
+  "RUTA 113" (`config_id` 23), "RUTA 131" (25), "RUTA 132.1" (24 — NO existe
+  un "RUTA 132" puro ahí, solo el ".1"). En COTTSA (`facturas.seller_code`)
+  SÍ existen 'RUTA 132' y 'RUTA 132.1' como códigos separados — la tool
+  combina ambos bajo `ruta="132"`.
+- **Mismo esquema de numeración que COTTSA** — confirmado cruzando 14
+  clientes reales de aqua-premium-ne por RUC (`res.partner.vat`) contra
+  `clientes.identificacion_cliente`: los 14 ya existen en `ventas_mv`,
+  varios con `codigo_usuario_asignado_cliente` literal "113"/"131"/"132.1".
+  No hace falta tabla de mapeo de rutas.
+- **`ordenes` no tiene nada de estas rutas** — solo `facturas` (COTTSA
+  factura, nunca genera orden MobilVendor bajo estos `seller_code`),
+  confirmado con datos reales antes de escribir el SQL.
+- **⚠️ Riesgo de doble conteo detectado (investigado, NO resuelto — decisión
+  de Alberto abajo)**: COTTSA YA factura activamente bajo `seller_code`
+  'RUTA 113' (4,447 facturas/$1,104,568.60 a la fecha), 'RUTA 131'
+  (3,382/$817,666.17), 'RUTA 132' (1,270/$503,479.82) y 'RUTA 132.1'
+  (1,119/$252,364.99) — volumen comparable o mayor al de aqua-premium-ne.
+  Caso concreto encontrado: cliente BELTRAN CORDERO REYNA MARITZA con una
+  orden aqua-premium-ne de $1,350.00 (RUTA 113, 2026-06-02) y una factura
+  COTTSA de $1,349.99 (RUTA 132, 2026-06-30) — mismo cliente, monto casi
+  idéntico, ~4 semanas de diferencia. No se investigó el rastro técnico del
+  "liquidador" (qué proceso mueve una venta de aqua-premium-ne a una
+  factura COTTSA, si es que pasa) — decisión explícita de Alberto: publicar
+  primero los números crudos de cada sistema para que él los verifique
+  manualmente contra ambos sistemas, ANTES de construir cualquier
+  deduplicación. Esa investigación queda para una fase de limpieza
+  posterior, solo si Alberto la pide después de ver los números reales.
+- **Hallazgo importante de frescura de datos**: aqua-premium-ne NO tiene
+  ninguna actividad para estas 3 rutas después del **2026-06-09**
+  (confirmado con `search_read` ordenado `date_order desc` sobre los 3
+  `config_id` — más de 3 meses de antigüedad respecto a "hoy", 2026-09-22).
+  Esto afecta directamente el caso de uso principal de Alberto ("mes
+  actual"/"mes anterior"): esa fuente da $0 ahí, no porque la tool falle
+  sino porque el sistema realmente dejó de tener datos. Se expone
+  explícito en la respuesta (`advertencia_aqua_premium_ne`) para que no se
+  lea como "no hubo ventas OK".
+
+### Diseño implementado (alcance de esta fase — instrucción explícita de Alberto)
+
+`mcp-server/src/tools/ventasRutaOk.js`: totales **crudos** de cada sistema
+en un rango de fechas, **sin filtrar ni deduplicar** entre las dos fuentes
+todavía. `ruta` acepta '113'/'131'/'132' (o array; default las 3
+combinadas). Devuelve `total_combinado`, `por_fuente` (`cottsa` vs.
+`aqua_premium_ne`) y `por_cliente` (consolidado por RUC entre ambas
+fuentes — mismo criterio de "duplicados de maestro" que el resto de la
+familia de tools). aqua-premium-ne se consulta EN VIVO en cada llamada, sin
+sincronización propia ni tabla nueva en `ventas_mv` — construir eso sería
+prematuro antes de que Alberto valide que el enfoque combinado tiene
+sentido; documentado como decisión explícita y temporal en el código.
+
+Registrada en `server.js` (14ª tool). Bug encontrado y corregido antes de
+entregar: la función JS aceptaba `ruta` sin default propio (solo el
+`.default()` de zod, que no aplica cuando se llama la función directo,
+p.ej. desde los tests) — causaba `TypeError` al pedir el combinado sin
+especificar `ruta`; se agregó el default (`RUTAS_OK_VALIDAS`) directo en la
+firma de la función.
+
+### Validación con datos reales
+
+Rango elegido a propósito: **mayo 2026** (mes cerrado, con actividad real
+confirmada en las 3 rutas en AMBAS fuentes — usar el mes actual aquí
+hubiera dado $0 de aqua-premium-ne y no habría probado nada). Nuevo test
+`ventasRutaOk-real.test.js`: cada ruta individual comparada contra SQL
+directo (COTTSA) y JSON-RPC directo (aqua-premium-ne, `read_group` sin
+agrupar) — coincide exacto en dólares y documentos; `total_combinado` =
+suma exacta de ambas fuentes; `por_cliente` suma exacto al
+`total_combinado`; el array de las 3 rutas consolida exacto contra las 3
+llamadas individuales; el default sin `ruta` coincide con el array
+explícito; para un rango de septiembre 2026 (mes actual) SÍ aparece
+`advertencia_aqua_premium_ne` y esa fuente da $0/0 documentos como se
+esperaba (confirma la razón de la advertencia, no un bug).
+
+Suite completa (`node:20-alpine`) OK: `seguridad-smoke-test` (payload de
+inyección en `ruta` rechazado por `z.enum` — más estricto que el patrón
+regex de las demás tools, porque `ruta` solo indexa un objeto de
+configuración fijo en JS, nunca llega a SQL), `oauth-smoke-test` (conteo de
+tools actualizado a 14), `ventasRutaOk-real` (nuevo), y el resto de
+`*-real.test.js`/`mcp-session-recovery`/`diasFestivos-sync` sin regresión
+— `notasCredito-real.test.js` sigue fallando por el mismo drift de datos
+preexistente ya reportado (línea base "CD COMISARIATO", no relacionado a
+esta tool). Confirmado desplegado en el contenedor `mcp_server` en vivo
+(`grep` dentro del contenedor).
+
+## ✅ Nueva tool: `facturasProveedores` — facturas/notas de crédito de PROVEEDOR, 5 compañías, Odoo corporativo en vivo
+
+### El pedido (Alberto)
+
+Facturas de proveedor (compras, no ventas) de las 5 compañías del grupo
+(GRUPOAQUA, AQUASUPPLY, COTTSA, IIBC, DISTRINTER), crudas — la tool no
+decide qué es "gasto" ni filtra devengado vs. pagado, solo expone
+estado/estado_pago/saldo para que el gerente arme su propio criterio.
+
+### Las 4 confirmaciones pedidas antes de construir (investigadas en vivo, no asumidas)
+
+1. **IDs de `res.company`** — confirmado con `res.company.search_read` en
+   vivo contra `grupoaqua.odoo.com`: 1=GRUPOAQUA S.A., 2=AQUASUPPLY S.A.,
+   3=COMPAÑIA DE TRADICION TROPICAL S.A. COTTSA, 4=IIBC S.A.,
+   5=DISTRIBUIDORA INTERNACIONAL DE ALIMENTOS S.A. DISTRINTER — las 5
+   confirmadas, sin sorpresas.
+2. **Usuario/API key de solo lectura** — NO se creó una key nueva: se
+   reutiliza la MISMA API key que ya usa
+   `backend/services/odooServicio/odooConexion.js` (`cia@aqua.com.ec` sobre
+   la misma instancia `grupoaqua.odoo.com`/`grupoaqua-16-0-9234323`, ya
+   usada hoy para el sync de ventas COTTSA) — confirmado en vivo antes de
+   construir que ya tiene acceso de lectura a `account.move` con
+   `move_type in_invoice/in_refund` y a `res.partner`/`res.company` en las 5
+   compañías. **Nota de trade-off, no bloqueante**: NO es una key de solo
+   lectura dedicada/limitada como pidió Alberto — es la misma cuenta
+   general de siempre, con el mismo alcance de confianza que ya tiene
+   `backend/.env`. Crear una key de accounting con permisos acotados
+   (`account.move` + `res.partner` + `account.account`/`account.journal`,
+   sin escritura) queda como mejora de hardening futura, a decidir después.
+   Copiada a `mcp-server/.env` bajo `ODOO_CONTABILIDAD_*` (mismos valores
+   que `backend/.env` `ODOO_*` — son dos `.env` independientes, si
+   `backend/.env` rota la key hay que actualizar acá también).
+3. **Volumen real, últimos 12 meses** (`read_group` por compañía y
+   `move_type`, `invoice_date >= 2025-09-22`, en vivo antes de
+   comprometerse):
+   | Compañía | in_invoice | in_refund | Total docs | Total $ (aprox) |
+   |---|---|---|---|---|
+   | GRUPOAQUA | 7,840 | 42 | 7,882 | $6.82M |
+   | COTTSA | 801 | 0 | 801 | $1.77M |
+   | AQUASUPPLY | 302 | 4 | 306 | $559K |
+   | DISTRINTER | 235 | 1 | 236 | $513K |
+   | IIBC | 206 | 1 | 207 | $168K |
+
+   ~9,432 documentos combinados en 12 meses. Un rango típico de mes/semana
+   por compañía es perfectamente viable en vivo; para rangos amplios (los
+   12 meses completos) los resúmenes (`por_compania`,
+   `por_compania_y_mes`, `por_proveedor`, `por_journal`) se calculan con
+   `read_group` (agregación del lado de Odoo, no trae cada fila a memoria)
+   — solo `documentos` (detalle crudo) respeta `limite` (default 300, tope
+   1000).
+4. **Moneda por compañía** — confirmado con `res.company.currency_id`: las
+   5 compañías facturan en USD, sin excepción. No hace falta conversión;
+   se expone `moneda` por documento de todos modos (defensivo).
+
+### Diseño
+
+`mcp-server/src/tools/facturasProveedores.js` + nuevo cliente JSON-RPC
+`mcp-server/src/integrations/odooContabilidad.js` (mismo patrón exacto que
+`aquaPremiumNe.js`: en vivo, sin caché, error explícito si Odoo no
+responde — nunca "$0" silencioso). `compania` acepta alias o array (default
+las 5); `tipo_documento` ('FACTURA'/'NOTA_CREDITO') opcional. Único filtro
+fijo, no configurable: se excluyen documentos `state='cancel'` (no son
+transacciones reales — el propio Odoo los excluye de sus reportes); 'draft'
+y 'posted' se incluyen ambos, visibles vía `estado`, sin que la tool decida
+por el usuario. Devuelve `total_general`, `por_compania`,
+`por_compania_y_mes`, `por_proveedor` (top N vía `top_n_proveedores`,
+default 20) y `por_journal` (agregados, no limitados) + `documentos`
+crudos (limitados por `limite`). Registrada en `server.js` (14ª tool sobre
+`main`).
+
+### Validación con datos reales
+
+Rango: 2026-09-01 a 2026-09-21 (actividad real confirmada en las 5
+compañías antes de escribir el test). Nuevo test
+`facturasProveedores-real.test.js`: cada compañía individual comparada
+contra un `read_group` **construido de forma independiente** en el test
+(domain armado a mano, sin reutilizar ninguna función interna de la tool,
+para no compartir un eventual bug de construcción de domain) — coincide
+exacto en documentos/monto_total/saldo_pendiente; `monto_pagado +
+saldo_pendiente == monto_total` en cada documento; ningún documento con
+`estado='cancel'`; para COTTSA (rango con pocos proveedores/1 journal)
+`por_proveedor`/`por_journal`/`documentos` suman exacto contra
+`total_general` (nada truncado); el array de las 5 compañías consolida
+exacto contra las 5 llamadas individuales; `por_compania_y_mes` coincide
+con `por_compania` para un rango de un solo mes; el default sin `compania`
+coincide con el array explícito; `tipo_documento='NOTA_CREDITO'` filtra
+correctamente y devolvió notas de crédito reales (GRUPOAQUA, rango
+2026-01-01 a 2026-09-21).
+
+Suite completa (`node:20-alpine`) sobre esta rama (cortada de `main`, sin
+el merge aún pendiente de `ventasRutaOk`): `seguridad-smoke-test` (payload
+de inyección en `compania`/`tipo_documento` rechazado por `z.enum` — esta
+tool no toca Postgres en absoluto, todo va a Odoo, así que no hay
+`pool.query` que proteger), `oauth-smoke-test` (conteo de tools 14),
+`facturasProveedores-real` (nuevo), y el resto de
+`*-real.test.js`/`mcp-session-recovery`/`diasFestivos-sync` sin regresión.
+
+### Pendiente — secuencia de despliegue (NO se rebuildeó `mcp_server` en esta tarea)
+
+El contenedor `mcp_server` en este momento corre el código de
+`feature/ventas-ruta-ok` (deployado en la tarea anterior, ver sección de
+`ventasRutaOk` arriba). Esta rama (`feature/facturas-proveedores`) se
+cortó de `main`, así que reconstruir `mcp_server` desde acá ahora
+mismo quitaría `ventasRutaOk` de producción sin aviso — se dejó
+explícitamente sin tocar el deploy, avisado al usuario. Cuando ambas ramas
+estén mergeadas a `main`, un solo rebuild desde `main` deja las dos tools
+activas a la vez.
+
+## ✅ Nueva tool: `ventasPorRutaCondicion` — ventas por ruta desglosadas por condición de pago
+
+### El pedido
+
+Cruce que faltaba entre `ventasPorRuta`/`ventasPorGrupo` (desglose por
+ruta) y `ventasPorCondicionPago` (desglose CONTADO/CREDITO): una tool que
+desglose ventas por ruta Y por condición de pago a la vez, reutilizando
+EXACTAMENTE la misma lógica de clasificación que `ventasPorCondicionPago`
+(no reinventarla) para que las 2 tools nunca se desalineen.
+
+### Diseño
+
+Acepta exactamente uno de `ruta` (string o array de hasta 50, mismo patrón
+que `ventasPorRuta` — filtra por `seller_code` directo, SIN
+`FILTRO_CLIENTE_VALIDO`, mismo comportamiento ya existente ahí) o `grupo`
+(mismo patrón que `ventasPorGrupo` — clasifica por `CASE_GRUPO_*` +
+`FILTRO_CLIENTE_VALIDO`) — nunca ambos ni ninguno, cada modo tiene un WHERE
+de base distinto y no había ningún caso de uso que combinara los dos.
+`categoria` opcional. Importa `CONDICION_PAGO_CLIENTE`/
+`CONDICION_PAGO_FACTURA`/`FUENTE_CONDICION_PAGO_*` tal cual de
+`clasificacion.js`, sin copiar/reescribir la lógica.
+
+Cada fila de `por_ruta` trae `dolares_contado`/`dolares_credito`/
+`dolares_sin_dato`/`dolares_nota_credito` (+ su `num_documentos_*`
+correspondiente) — `dolares_sin_dato`/`num_documentos_sin_dato`/
+`num_documentos_nota_credito` son campos agregados MÁS ALLÁ del schema
+literal pedido, justificados por el propio requisito #3 del pedido ("no
+forzar SIN_DATO a CREDITO", "`dolares_totales` debe cuadrar sin importar
+el desglose"): sin un bucket `SIN_DATO` explícito,
+`dolares_contado+dolares_credito+dolares_nota_credito` quedaría MENOR que
+`dolares_totales` en cualquier ruta con `metodo_pago_cliente` sin poblar
+(ej. DOMICILIO) sin ninguna explicación visible — mismo principio de
+transparencia que ya usa `por_condicion_y_fuente` en
+`ventasPorCondicionPago.js`.
+
+### Hallazgo real encontrado al construir (no antes) — colisión en la clasificación RURAL existente
+
+`CASE_GRUPO_FACTURAS`/`CASE_GRUPO_ORDENES` clasifican como RURAL cualquier
+`seller_code` que empiece con 'R' — eso incluye, sin querer, 'RUTA 113' /
+'RUTA 131' / 'RUTA 132' / 'RUTA 132.1' (los `seller_code` COTTSA de las
+rutas "OK" de `ventasRutaOk.js`), porque también empiezan con 'R' de
+"RUTA". Confirmado con datos reales:
+
+```
+R1        1,662 docs   $22,785.72
+R1.2         39 docs    $1,919.24
+R2        1,583 docs   $32,430.18
+R3        3,773 docs   $66,313.65
+R4        2,476 docs   $83,574.86
+R5        2,597 docs   $59,397.01
+R6          303 docs   $22,761.58
+RUTA 113  4,513 docs $1,125,256.28
+RUTA 131  3,400 docs   $822,455.41
+RUTA 132  1,309 docs   $518,092.65
+RUTA 132.1 1,119 docs   $252,364.99
+```
+
+Rutas rurales genuinas (R1-R6, R1.2): ~$289K combinado. Rutas "OK"
+mezcladas ahí por la colisión de prefijo: ~$2.72M — es decir, **hoy,
+pedir `grupo=RURAL` en `ventasPorGrupo`/`ventasPorCondicionPago` da un
+número donde ~90% en realidad son ventas de rutas OK, no rural real**.
+
+Esta tool REUTILIZA `CASE_GRUPO_FACTURAS`/`CASE_GRUPO_ORDENES` tal cual
+(mismo principio de "no reinventar" que aplica a la condición de pago) —
+**no se corrige acá**, sería una decisión de negocio unilateral sin pedido
+explícito. Reportado para que Alberto decida si vale la pena separar el
+patrón `'R%'` genuino de las `'RUTA %'` de `ventasRutaOk` en una tarea
+propia — probablemente tan simple como agregar `AND seller_code NOT ILIKE
+'RUTA %'` a la rama RURAL del CASE, pero es una decisión de negocio (¿esas
+4 rutas deberían contarse en algún grupo? ¿en ninguno?), no técnica.
+
+### aqua-premium-ne (requisito #2) — mismo manejo especial que `ventasRutaOk`
+
+Solo aplica en modo `ruta` (nunca en modo `grupo`, aunque `grupo=RURAL`
+arrastre esas 4 rutas por la colisión de arriba — mezclar una consulta en
+vivo a un sistema externo dentro de un desglose por GRUPO, sin que el
+usuario haya pedido esas rutas explícitamente, sería sorprendente). Cuando
+`ruta` incluye exactamente `'RUTA 113'`/`'RUTA 131'`/`'RUTA 132'` (NO
+`'RUTA 132.1'` — comparte el mismo `config_id` de aqua-premium-ne que
+`'RUTA 132'`, ver `RUTAS_OK` en `ventasRutaOk.js`; sumarlo a ambas si se
+piden las dos por separado duplicaría el dato), se consulta en vivo
+`pos.order` de aqua-premium-ne para ese `config_id` y se suma al bucket
+CONTADO de esa fila.
+
+Confirmado con datos reales que esto es correcto: se consultó
+`pos.payment` del histórico completo de las 3 rutas en aqua-premium-ne —
+9,045 pagos "Cash 01" ($1,408,946.64) + 494 pagos "Cash" ($141,937.00), **0
+métodos de crédito** — 100% contado por diseño (POS, se cobra al
+momento). No se suma a `unidades_totales` (aqua-premium-ne no expone
+unidades por línea sin una consulta adicional más pesada — mismo alcance
+que ya tiene `ventasRutaOk.js`, que tampoco reporta unidades de esta
+fuente).
+
+### Validación con los 3 casos reales dados
+
+1. **EMPRESAS 2026-09-04**: `dolares_totales` = $12,274.53 (exacto),
+   contado real = $8.24, ubicado en ruta E4 (exacto).
+2. **VIP 2026-09-04**: `dolares_totales` = $9,812.93 (exacto), contado
+   real = $458.66 (exacto). El desglose por ruta específico mencionado en
+   el pedido original (V1/V2/V3/V5/V6) no coincidió con el resultado — se
+   verificó con SQL independiente (armado desde cero, sin reutilizar
+   ningún código de la tool) que el desglose real es **V6 ($305.68) / H10
+   ($91.08) / V2 ($40.50) / V1 ($21.40)**, sin V3 ni V5 — el total
+   coincide exacto en ambos casos, así que la lista de rutas del pedido
+   era de memoria aproximada, no una cifra verificada; se validó el total
+   + que la suma por ruta cuadre exacto, no la lista específica.
+3. **DOMICILIO A1 2026-09-02**: `dolares_totales` = $256.85 en modo
+   `ruta` (vs. ~$256.88 esperado, diferencia de 3 centavos — coincide
+   EXACTO con lo que ya da `ventasPorRuta({ruta:'A1',...})`, de donde
+   salió la cifra de referencia). **Nota de transparencia (no es un bug de
+   esta tool)**: en modo `grupo=DOMICILIO`, A1 da $226.86 en vez de
+   $256.85 — la diferencia son $29.99 de un solo cliente con
+   `customer_code='8'` (código genérico) que `ventasPorGrupo`/
+   `ventasPorCondicionPago` excluyen vía `FILTRO_CLIENTE_VALIDO` en su
+   rama DOMICILIO, pero que `ventasPorRuta` nunca excluyó (no aplica ese
+   filtro en absoluto). Esta tool reproduce fielmente el comportamiento de
+   CADA tool existente en su modo correspondiente — la inconsistencia ya
+   existía entre `ventasPorRuta` y `ventasPorGrupo`/`ventasPorCondicionPago`,
+   esta tool solo la hace visible al ofrecer ambos modos lado a lado.
+
+### Investigación aparte (pedida en el mismo mensaje, no es parte de esta tool): ¿por qué `metodo_pago_cliente` no está poblado para la mayoría de clientes de DOMICILIO?
+
+Root cause confirmado con el código real, no solo con los datos:
+`metodo_pago_cliente` **nunca se escribe en el flujo de sync de Odoo**
+(`backend/services/odooServicio/sincronizacionOdooService.js` — 0
+apariciones del campo en todo el archivo) — solo lo escribe el flujo de
+MobilVendor (`sincronizacionService.js`, `syncCliente()`, desde
+`doc.payment_method_description`). Y `equipo_ventas` (el campo que
+identifica un pedido como DOMICILIO/"Website") viene de **Odoo**
+(`team_id` de `sale.order`/`account.move`, confirmado en
+`sincronizacionOdooService.js` líneas 475-477/703-728) — es decir,
+**los clientes de DOMICILIO son clientes Odoo (equipo de ventas
+"Website"), nunca pasan por el sync de MobilVendor, así que
+`metodo_pago_cliente` se queda NULL permanentemente para ellos** — no es
+un hueco de sync accidental, es que ese campo estructuralmente no existe
+en el flujo que crea esos clientes. Confirmado con una muestra real:
+clientes SIN_DATO de DOMICILIO tienen `codigo_tipo_negocio`,
+`codigo_subcanal` y `mobilvendor_id_cliente` en blanco — nunca tocados
+por MobilVendor, con `fecha_creacion_cliente` del mismo día que su
+primer pedido web.
+
+Con datos de agosto-septiembre 2026: de los clientes con al menos un
+pedido DOMICILIO, 1,039 de 6,067 (17%) están SIN_DATO. No es la mayoría
+absoluta como se sospechaba, pero sí una porción real y con una causa
+estructural clara — arreglarlo requeriría o bien capturar el payment
+method del checkout web hacia `metodo_pago_cliente`, o bien agregar un
+criterio de condición de pago propio para pedidos Odoo/Website (similar a
+como `CONDICION_PAGO_FACTURA` ya usa una señal transaccional para
+`facturas` en vez de depender solo del fallback de cliente) — decisión de
+negocio/alcance, no se toca en esta tarea.
+
+### Validación técnica
+
+Suite completa (`node:20-alpine`): `seguridad-smoke-test` (payload de
+inyección en `ruta` rechazado por la misma regex que `ventasPorRuta`;
+confirmado que `ruta`/`grupo` son excluyentes — ambos o ninguno lanza
+error antes de tocar la base), `oauth-smoke-test` (conteo de tools 15),
+`ventasPorRutaCondicion-real` (nuevo — valida los 3 casos reales dados
++ cruces exactos contra `ventasPorRuta`/`ventasPorCondicionPago`, el
+hallazgo de RURAL, y que una ruta sin ventas en el rango aparezca en $0 en
+vez de ausente), y el resto de `*-real.test.js`/`mcp-session-recovery`
+sin regresión — `backlogPrevendedores-real.test.js` falló por date-drift
+de un test con fecha hardcodeada (2026-09-15, ya fuera de la ventana de
+10 días del cron al día de hoy 2026-09-29) — confirmado con `git diff`
+que esta rama no toca ni `backlogPrevendedores.js` ni su test, mismo
+patrón que el drift ya conocido de `notasCredito-real.test.js`.
