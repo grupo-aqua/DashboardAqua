@@ -10,6 +10,7 @@ const { sincronizarVentasRango, sincronizarPromociones } = require('../services/
 const { sincronizarOdooCompletoRango } = require('../services/odooServicio/sincronizacionOdooService');
 const { sincronizarRutasYDetalles }    = require('../services/syncRouteDetailsService');
 const { obtenerHistorialDeUsuarios }   = require('../services/syncHistorialVisitasService');
+const { sincronizarParadasFlota }      = require('../services/vigiloServicio/sincronizacionVigiloService');
 
 // ================================================================
 // LOGGING
@@ -175,4 +176,42 @@ cron.schedule('0 12 * * *', async () => {
   await ejecutarSincronizacion('CRON 12:00 PM', fechaStr(-DIAS_RETRO), fechaStr(0));
 }, { timezone: 'America/Guayaquil' });
 
-log('CRON inicializado — ejecuciones diarias: 12:00 AM y 12:00 PM (America/Guayaquil)');
+// ================================================================
+// CRON 3 — 23:00 (flota Vigilo)
+// Corre APARTE de MobilVendor/Odoo/Rutas/Visitas — no comparte `isRunning`
+// con esos: son sistemas completamente distintos (Vigilo, no MobilVendor/
+// Odoo) y esta corrida es lenta por el rate limit propio de la API de
+// Vigilo (1 llamada/15s, ~34 vehículos → ~9 minutos), no tiene sentido que
+// bloquee ni se bloquee con la sincronización de ventas. Horario elegido
+// para correr después de que terminan las rutas del día (ver TODO.md,
+// investigación de umbrales: actividad real de la flota cae a night-time
+// para casi todos los vehículos bastante antes de esa hora).
+let isRunningVigilo = false;
+
+cron.schedule('0 23 * * *', async () => {
+  if (isRunningVigilo) {
+    log('[Vigilo] Sincronización anterior aún en curso — ejecución omitida', 'WARN');
+    return;
+  }
+  isRunningVigilo = true;
+  const inicio = Date.now();
+  log('[Vigilo] Iniciando sync de paradas de flota (ventana 3 días)...');
+  try {
+    const resultado = await sincronizarParadasFlota();
+    const duracion = ((Date.now() - inicio) / 1000).toFixed(1);
+    log(
+      `[Vigilo] OK en ${duracion}s — roster=${resultado.roster} vehiculos, ` +
+      `sincronizados=${resultado.vehiculosSincronizados}, tramos=${resultado.tramosGuardados}, ` +
+      `errores=${resultado.errores.length}`
+    );
+    for (const e of resultado.errores) {
+      log(`[Vigilo]   error en ${e.tag}: ${e.error}`, 'WARN');
+    }
+  } catch (e) {
+    log(`[Vigilo] ERROR: ${e.message ?? 'desconocido'}`, 'ERROR');
+  } finally {
+    isRunningVigilo = false;
+  }
+}, { timezone: 'America/Guayaquil' });
+
+log('CRON inicializado — ejecuciones diarias: 12:00 AM, 12:00 PM (ventas) y 23:00 (flota Vigilo), America/Guayaquil');

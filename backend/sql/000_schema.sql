@@ -1490,6 +1490,46 @@ CREATE INDEX IF NOT EXISTS idx_plv_seller     ON promo_lineas_venta(seller_code)
 CREATE INDEX IF NOT EXISTS idx_plv_fecha      ON promo_lineas_venta(fecha);
 
 
+-- ── Flota (Vigilo/SeamTrack, b2b.vigiloo.net) — tramos de ruta/parada por
+-- vehículo, sincronizados por cron (23:00 America/Guayaquil, ventana
+-- rodante de 3 días — ver backend/cron/tareasCron.js y
+-- backend/services/vigiloServicio/). Solo lectura desde mcp-server (tool
+-- auditoriaParadasFlota, aún no construida) — nunca se consulta Vigilo en
+-- vivo desde ahí, por el rate limit real de la API (1 llamada/15s, ~34
+-- vehículos → ~9 min por corrida, inviable bajo demanda).
+CREATE TABLE IF NOT EXISTS vigilo_vehiculos (
+  target_id      UUID PRIMARY KEY,              -- GUID de Vigilo (Target.TargetId)
+  tag            VARCHAR(20) NOT NULL,           -- ej. 'T5' — coincide directo con seller_code (confirmado con datos reales, sin tabla de mapeo)
+  grupo_vigilo   VARCHAR(50),                    -- TargetGroup.Name en Vigilo (TIENDAS, EMPRESAS, VIP, RURAL, MAYORISTAS, HIELO, DESCARTABLE)
+  placa          VARCHAR(20),
+  activo         BOOLEAN NOT NULL DEFAULT TRUE,  -- false si desaparece de TrackONLINE (vehículo dado de baja en Vigilo)
+  actualizado_en TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- `trace_id` es el TraceId real de Vigilo (identificador único del tramo) —
+-- se usa como PK para que el sync sea un UPSERT idempotente, nunca duplica
+-- filas al resincronizar la ventana rodante de 3 días.
+CREATE TABLE IF NOT EXISTS vigilo_tramos_ruta (
+  trace_id           BIGINT PRIMARY KEY,
+  target_id          UUID NOT NULL REFERENCES vigilo_vehiculos(target_id),
+  tipo_tramo         VARCHAR(10) NOT NULL CHECK (tipo_tramo IN ('RUTA','PARADA')),
+  desde_fecha        TIMESTAMP NOT NULL,
+  hasta_fecha        TIMESTAMP NOT NULL,
+  duracion_segundos  INTEGER NOT NULL,
+  desde_lat          NUMERIC(10,6),
+  desde_lon          NUMERIC(10,6),
+  hasta_lat          NUMERIC(10,6),
+  hasta_lon          NUMERIC(10,6),
+  desde_direccion    TEXT,
+  hasta_direccion    TEXT,
+  cruza_medianoche   BOOLEAN NOT NULL,            -- date(desde_fecha) != date(hasta_fecha)
+  odometro_distancia NUMERIC(10,2),
+  sincronizado_en    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_vigilo_tramos_target_fecha ON vigilo_tramos_ruta(target_id, desde_fecha);
+CREATE INDEX IF NOT EXISTS idx_vigilo_tramos_tipo         ON vigilo_tramos_ruta(tipo_tramo);
+
 -- ── Auditoría del chatbot IA (consultas y SQL generado) ────────────────
 CREATE TABLE IF NOT EXISTS auditoria_chat (
   id              SERIAL PRIMARY KEY,

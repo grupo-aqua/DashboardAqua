@@ -28,6 +28,8 @@ const PromoCondicion = require('./PromoCondicion');
 const PromoAccion = require('./PromoAccion');
 const UsuarioEnPromo = require('./UsuarioEnPromo');
 const PromoLineaVenta = require('./PromoLineaVenta'); // líneas de venta con promo (aisladas de Odoo)
+const VigiloVehiculo = require('./VigiloVehiculo');       // 🔥 NUEVO — flota Vigilo
+const VigiloTramoRuta = require('./VigiloTramoRuta');     // 🔥 NUEVO — tramos ruta/parada Vigilo
 
 // =============================
 // RELACIONES
@@ -255,6 +257,16 @@ UsuarioEnPromo.belongsTo(Promo, {
   as        : 'promo',
 });
 
+// ---------- VIGILO (flota) ----------
+VigiloVehiculo.hasMany(VigiloTramoRuta, {
+  foreignKey: 'target_id',
+  as        : 'tramos',
+});
+VigiloTramoRuta.belongsTo(VigiloVehiculo, {
+  foreignKey: 'target_id',
+  as        : 'vehiculo',
+});
+
 // =============================
 // EXPORTACIÓN
 // =============================
@@ -284,5 +296,7 @@ module.exports = {
   PromoAccion,
   UsuarioEnPromo,
   PromoLineaVenta,
+  VigiloVehiculo,
+  VigiloTramoRuta,
   sequelize,
 };
