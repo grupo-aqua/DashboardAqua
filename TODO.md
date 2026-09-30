@@ -5073,26 +5073,36 @@ gerente** (parámetro de la tool `auditoriaParadasFlota`, no un número fijo
 en el código — mismo patrón que los umbrales del semáforo de activos),
 mientras se calibra con datos reales.
 
-### Detección de la "parada en planta" — pendiente de confirmar con Alberto
+### Detección de la "parada en planta" — confirmado, 2 sedes reales de Grupo Aqua
 
 Pedido explícito: no dar una dirección a mano, detectar con los propios
 datos el punto donde más vehículos arrancan/terminan el día. Encontrado
-con la muestra de 3 semanas — **dos candidatos reales, no uno**:
+con la muestra de 3 semanas — **dos puntos reales**, ambos confirmados por
+el usuario como sedes de Grupo Aqua (no un hallazgo externo/sospechoso):
 
 1. **"Aqua Sprint" / "Aqua sprint embotelladora de agua" / "Planta Aqua"**
    (Vigilo ya lo reverse-geocodifica con ese nombre) — lat≈-2.0842,
    lon≈-79.9441, Vía Perimetral, Importadora Guzman, Guayaquil. 2,809+1,389+605
-   menciones en total (From/To de cualquier tramo).
+   menciones en total (From/To de cualquier tramo). **Confirmado: la
+   fábrica principal.**
 2. **"Arturo Feraud Stagg"/"Azende Corporación", Monte Bello, Tarqui,
    Guayaquil** — lat≈-2.1030, lon≈-79.9426 (los 2 nombres son el mismo
    punto físico, ~60-70m de separación, reverse-geocoding ruidoso de
-   Vigilo) — **más frecuente como arranque/fin de día que la planta**
-   (577 vs. 296 combinado) — probablemente un patio/depósito de
-   despacho distinto de la planta embotelladora.
+   Vigilo). **Confirmado: OTRA sede de Grupo Aqua** (no un patio externo
+   ni nada que investigar por fuera de la empresa — primera lectura de
+   esta sesión fue incorrecta al suponerlo ajeno). Patrón real con datos
+   (2 noches completas, 27 de 34 vehículos rastreados, todos los grupos):
+   llegan 13:33-22:04, salen 05:40-07:14 del día siguiente, 9-17h
+   parqueados — más frecuente como arranque/fin de día que la fábrica
+   principal (577 vs. 296 menciones combinadas). Los otros 7 vehículos
+   (D8, DR1, E8, H6, V1, V4, V6) sí duermen en la sede de Vía Perimetral.
 
-No se excluyó nada del reporte todavía — falta que Alberto confirme cuál
-o cuáles de estos 2 puntos son reales (planta vs. depósito/patio) antes de
-aplicar la exclusión en `auditoriaParadasFlota`.
+**Ambos puntos se excluyen** del reporte de "parada larga sin venta" en
+`auditoriaParadasFlota` (aún no construida) — dormir en cualquier sede
+propia no es una parada evaluable, sea cual sea. Coordenadas para la
+exclusión: Vía Perimetral (radio ~150m alrededor de lat -2.0842/lon
+-79.9441) y Monte Bello/Tarqui (radio ~150m alrededor de lat -2.1030/lon
+-79.9426).
 
 ### El sync — diseño e implementación
 
