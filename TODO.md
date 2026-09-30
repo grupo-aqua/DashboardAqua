@@ -4987,3 +4987,174 @@ Sigue sin resolverse ~0% (en este rango) o hasta ~39% (según la
 investigación de censo completo) de los SIN_DATO que tampoco tienen RUC
 usable o no resuelven ni siquiera vía Odoo — esos genuinamente no tienen
 fuente de verdad en ningún sistema hoy.
+
+## ✅ Sync de flota Vigilo — `vigilo_vehiculos`/`vigilo_tramos_ruta` (paso 1 de `auditoriaParadasFlota`, tool aún no construida)
+
+### El pedido
+
+Preparar la base para `auditoriaParadasFlota` (MCP): detectar paradas
+largas sin venta, paradas lejos del cliente, y visitas fuera de ruta,
+cruzando contra `auditoriaClientes` (ya en producción) para no confundir
+"coordenada de cliente mala" con "conductor parado lejos de verdad". Antes
+de tocar código: resolver 5 preguntas técnicas sobre la API de Vigilo
+(`b2b.vigiloo.net`), y diseñar el sync como job programado (no consulta en
+vivo) por el rate limit real de la API.
+
+### Investigación — las 5 preguntas técnicas (resueltas en vivo, doc encontrada en `b2b.vigiloo.net/Help`)
+
+1. **Autenticación**: NO hay Basic Auth ni token — el `accountId` (GUID,
+   cuenta `cia@aqua.com.ec`) como query param en cada request YA es la
+   credencial completa. Confirmado: `GET /api/Check?accountId=...` → `200`
+   / `true` sin ningún header de auth. Guardado como `VIGILO_ACCOUNT_ID`
+   en `backend/.env` (nunca en el repo, confirmado ignorado por git) — la
+   tool MCP no lo necesita, solo el sync de backend lo usa.
+2. **Fuente de paradas**: `TargetStatusRouteActivityBreaks` es
+   estructuralmente un snapshot EN VIVO — no tiene parámetro de fecha en
+   absoluto en la doc real de Vigilo, confirmado con `minStopTime=0`
+   devolviendo vacío. `TargetRouteQry?accountId&targetId&fromDate&toDate&includePositions&includeActivities=true`
+   sí sirve para histórico, y mejor de lo esperado: ya devuelve los tramos
+   "Ruta"/"Parada" calculados (`OnRouteTime`/`OnStopTime` por tramo) — no
+   hace falta reconstruir paradas a mano desde posiciones crudas.
+3. **Tag de vehículo vs. código de ruta**: coinciden DIRECTO, sin tabla de
+   mapeo — confirmado trayendo la flota completa (`TrackONLINE`, 37
+   vehículos): T1-T11 (TIENDAS), E1-E10 (EMPRESAS), V1-V6 (VIP), R1-R4
+   (RURAL), M2/M4/M5 (MAYORISTAS), H4/H6 (HIELO), D8/DR1 (DESCARTABLE) —
+   y `TargetGroup.Name` de Vigilo coincide con los nombres de grupo del
+   dashboard. Excepciones confirmadas y excluidas del sync:
+   `C8`/`C9` (grupo Vigilo "COMODINES" — vehículos de respaldo, sin ruta) y
+   `GOH0723` (grupo "Todos", tag=placa — parece admin/prueba). DOMICILIO,
+   COTTSA (RUTA 113/131/132) y TELEVENTA no tienen NINGÚN vehículo en la
+   flota de Vigilo — cobertura parcial, no es un bug del sync.
+4. **Rate limit/paginación**: 1 llamada cada 15 segundos, GLOBAL (no por
+   endpoint) — mensaje explícito de la propia API: `"Quota exceeded. Limit
+   maximum 1 call every 15 seconds"` (HTTP 429). Sin parámetros de
+   paginación en ningún endpoint de lista (la doc dice "LISTA COMPLETA").
+   Con 34 vehículos, una corrida completa toma ~9 minutos — **inviable
+   para una tool MCP bajo demanda**, de ahí la decisión de sync programado
+   (mismo patrón que MobilVendor → Postgres) en vez de consulta en vivo
+   como `facturasProveedores`.
+5. **Umbrales**: ver sección de calibración abajo (muestreo real de 34
+   vehículos × 3 semanas antes de fijar el de duración; el de distancia
+   queda pendiente de calibrar con la tabla ya sincronizada).
+
+### Calibración de "parada larga sin venta" — 11,893 paradas reales, 34 vehículos, 3 semanas
+
+Muestreo previo a construir nada: `TargetRouteQry` para los 34 vehículos,
+2026-09-08 a 2026-09-29. Distribución de duración (excluyendo tramos que
+cruzan medianoche): mediana 6.3 min, p25 2.65 min, p75 15.5 min, p90 33.5
+min, p95 58.6 min, p99 ~2.5h.
+
+**Hallazgo que obligó un segundo filtro, más allá de medianoche**: 51
+paradas (0.43% de la muestra, en 17 vehículos distintos — no es un caso
+aislado) con duración de HORAS o incluso 222 HORAS reportadas por Vigilo
+para tramos donde el timestamp real `FromTrackerDate`→`ToTrackerDate` solo
+difiere en minutos (ej. T2: `OnStopTime=222.5h` pero
+`10:35:44`→`10:44:40`, 9 minutos de diferencia real) — desincronización
+real del dato de Vigilo (probable pérdida de conectividad del tracker),
+no una parada real. No cruza medianoche, así que ESE filtro solo no lo
+agarra — hace falta un techo de duración aparte.
+
+**Umbral final (confirmado con Alberto)**: parada larga sin venta =
+tramo `PARADA`, mismo día, entre **15 minutos y 2 horas**. Por debajo:
+normal. Por encima de 2h: NO se reporta como parada larga, se marca aparte
+como "posible anomalía de datos del tracker, no evaluable" (evidencia de
+arriba). Con este rango, ~4.4% de las paradas reales de la flota
+calificarían como "larga" — señal manejable, no ruido.
+
+### Umbral de "lejos del cliente" — pendiente de calibrar con datos reales, default operativo 100m
+
+A diferencia de duración, distancia necesita cruzar cada parada contra el
+cliente que se suponía visitar ahí (`ordenes`/`clientes` de esa
+ruta/fecha) — no se hizo todavía, es una correlación más pesada (parada ×
+visita esperada) que ahora sí se puede hacer contra `vigilo_tramos_ruta`
+ya sincronizada, sin gastar más llamadas a Vigilo. **Decisión de Alberto**:
+arrancar con **100 metros como default operativo, configurable por el
+gerente** (parámetro de la tool `auditoriaParadasFlota`, no un número fijo
+en el código — mismo patrón que los umbrales del semáforo de activos),
+mientras se calibra con datos reales.
+
+### Detección de la "parada en planta" — confirmado, 2 sedes reales de Grupo Aqua
+
+Pedido explícito: no dar una dirección a mano, detectar con los propios
+datos el punto donde más vehículos arrancan/terminan el día. Encontrado
+con la muestra de 3 semanas — **dos puntos reales**, ambos confirmados por
+el usuario como sedes de Grupo Aqua (no un hallazgo externo/sospechoso):
+
+1. **"Aqua Sprint" / "Aqua sprint embotelladora de agua" / "Planta Aqua"**
+   (Vigilo ya lo reverse-geocodifica con ese nombre) — lat≈-2.0842,
+   lon≈-79.9441, Vía Perimetral, Importadora Guzman, Guayaquil. 2,809+1,389+605
+   menciones en total (From/To de cualquier tramo). **Confirmado: la
+   fábrica principal.**
+2. **"Arturo Feraud Stagg"/"Azende Corporación", Monte Bello, Tarqui,
+   Guayaquil** — lat≈-2.1030, lon≈-79.9426 (los 2 nombres son el mismo
+   punto físico, ~60-70m de separación, reverse-geocoding ruidoso de
+   Vigilo). **Confirmado: OTRA sede de Grupo Aqua** (no un patio externo
+   ni nada que investigar por fuera de la empresa — primera lectura de
+   esta sesión fue incorrecta al suponerlo ajeno). Patrón real con datos
+   (2 noches completas, 27 de 34 vehículos rastreados, todos los grupos):
+   llegan 13:33-22:04, salen 05:40-07:14 del día siguiente, 9-17h
+   parqueados — más frecuente como arranque/fin de día que la fábrica
+   principal (577 vs. 296 menciones combinadas). Los otros 7 vehículos
+   (D8, DR1, E8, H6, V1, V4, V6) sí duermen en la sede de Vía Perimetral.
+
+**Ambos puntos se excluyen** del reporte de "parada larga sin venta" en
+`auditoriaParadasFlota` (aún no construida) — dormir en cualquier sede
+propia no es una parada evaluable, sea cual sea. Coordenadas para la
+exclusión: Vía Perimetral (radio ~150m alrededor de lat -2.0842/lon
+-79.9441) y Monte Bello/Tarqui (radio ~150m alrededor de lat -2.1030/lon
+-79.9426).
+
+### El sync — diseño e implementación
+
+**Frecuencia**: cron nocturno, 23:00 America/Guayaquil (después de que
+terminan las rutas del día), ventana rodante de 3 días (hoy + 2 atrás) —
+mismo motivo que el cron de MobilVendor resincroniza los últimos
+`DIAS_RETRO` días: cubre correcciones tardías del lado de Vigilo sin
+lógica incremental compleja. Corre APARTE del cron de ventas (lock propio,
+`isRunningVigilo`) — son sistemas completamente distintos, no tiene
+sentido que se bloqueen entre sí.
+
+**Esquema** (`backend/sql/000_schema.sql`): `vigilo_vehiculos` (roster de
+la flota, refrescado en cada corrida desde `TrackONLINE` — `target_id` PK,
+`tag`, `grupo_vigilo`, `placa`, `activo`) y `vigilo_tramos_ruta` (cada
+tramo Ruta/Parada de `TargetRouteQry`, `trace_id` de Vigilo como PK —
+UPSERT idempotente, nunca duplica al resincronizar la ventana rodante —
+`cruza_medianoche` calculado y guardado en el sync, no en cada consulta).
+
+**Implementación**: `backend/services/vigiloServicio/vigiloConexion.js`
+(cliente REST — cola interna que serializa TODAS las llamadas con
+`setTimeout` de 15.5s entre cada una, nunca paralelo, respeta el rate
+limit real) + `sincronizacionVigiloService.js` (`sincronizarParadasFlota`:
+refresca roster, filtra los 3 tags excluidos, sincroniza tramos vehículo
+por vehículo — un error en un vehículo no tumba la corrida completa,
+igual que el resto de esta suite de sync). Registrado en
+`cron/tareasCron.js`. Script manual de prueba:
+`backend/scripts/syncVigilo.js` (mismo patrón que `syncPromos.js`).
+
+### Validación con datos reales
+
+SQL validado en vivo contra `dashboard_postgres` antes de tocar
+`dashboard_backend` (CREATE TABLE ejecutado directo, sin pasar por un
+redeploy). Corrida real completa del sync (`syncVigilo.js` dentro del
+contenedor, código copiado sin reiniciar el proceso — mismo patrón de
+verificación ya usado para `mcp_server`):
+
+```json
+{ "roster": 37, "vehiculosSincronizados": 34, "tramosGuardados": 2819, "errores": [] }
+```
+
+Confirmado en Postgres: 37 vehículos (`activo=true`), 1,426 tramos RUTA +
+1,393 tramos PARADA, ventana real 2026-09-28 a 2026-09-30 (3 días, como se
+diseñó), 65 tramos con `cruza_medianoche=true` correctamente detectados.
+
+### Fuera de alcance en esta tarea
+
+No se construyó todavía la tool MCP `auditoriaParadasFlota` — el pedido
+explícito de Alberto fue primero el sync + umbral de duración + confirmar
+el diseño de distancia/planta. Las categorías "coordenada mal puesta" y
+"visita fuera de ruta" quedan pendientes de la calibración de distancia.
+NO se desplegó `dashboard_backend` con este cambio (cron nuevo incluido)
+— el contenedor sigue corriendo el código de antes; el sync real de esta
+sección se probó copiando el código al contenedor vivo sin reiniciarlo,
+por la misma disciplina de esta sesión de no redesplegar `dashboard_backend`
+sin autorización explícita aparte.
