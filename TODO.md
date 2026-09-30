@@ -5158,3 +5158,162 @@ NO se desplegó `dashboard_backend` con este cambio (cron nuevo incluido)
 sección se probó copiando el código al contenedor vivo sin reiniciarlo,
 por la misma disciplina de esta sesión de no redesplegar `dashboard_backend`
 sin autorización explícita aparte.
+
+## ✅ Ampliación de `auditoriaClientes` (Fase 1b) — filtro por compañía, paginación, nuevos subtipos de coordenadas, contexto, duplicados mejorados
+
+### El pedido
+
+Ampliar la tool `auditoriaClientes` (Fase 1, solo diagnóstico, ya en
+producción) sin tocar su naturaleza de solo lectura: filtro por
+`company_id`, paginación real (sin tope de 500), nuevos subtipos de
+`coordenadas`, contexto por registro (última compra, ruta, grupo, etc.) en
+`coordenadas`/`duplicados`, y 5 mejoras a la detección de duplicados. No
+tocar ninguna otra tool.
+
+### Hallazgos de la investigación (antes de construir)
+
+- `clientes.company_id` (MobilVendor) YA coincide 1:1 con `res.company` de
+  Odoo (mismos 5 ids ya validados en `facturasProveedores`: 1=GRUPOAQUA,
+  2=AQUASUPPLY, 3=COTTSA, 4=IIBC, 5=DISTRINTER) Y trae
+  `descripcion_company` (el nombre) en la misma fila — `listar_companias`
+  no necesita tocar Odoo, sale 100% de Postgres. 2,340 de 20,431 clientes
+  tienen `company_id` NULL.
+- `pg_trgm` (`similarity()`) y `unaccent` YA están instalados en esta base
+  (`unaccent` ya se usaba en `ventasCliente.js`) — se reutilizan sin
+  agregar dependencias nuevas, para nombre normalizado y las 2 señales
+  nuevas de similitud.
+- `codigo_cliente` tiene exactamente 3 patrones reales (confirmado con
+  datos): NUMERICO (20,136), 'GA...' (233), 'CL...' (151) — usado para
+  `origen_codigo`.
+- **FORMATO_INVALIDO** (coordenada no numérica/con coma/texto): la columna
+  real (`direcciones_clientes.latitud_direccion_cliente`/`longitud_...`)
+  es `NUMERIC(15,8)` — Postgres RECHAZA cualquier valor no numérico al
+  insertar. Este tipo de problema **no puede existir hoy** en los datos ya
+  guardados — se implementó de todos modos (defensivo, por si cambia el
+  tipo de columna algún día) pero siempre da 0, confirmado con datos
+  reales, no es un bug del código.
+- **BAJA_PRECISION** (menos de 4 decimales): la columna de escala fija
+  rellena con ceros hasta 8 decimales al guardar — no se puede recuperar
+  la precisión ORIGINAL real (un valor cargado con 1 decimal se ve igual
+  en texto crudo que un GPS real que termine en .X0000000 por
+  coincidencia). Se usa como proxy la cantidad de decimales
+  SIGNIFICATIVOS tras recortar ceros finales — aproximación razonable,
+  documentada, no medición exacta. Con datos reales: 77 casos.
+
+### Lo construido
+
+- `company_id` (opcional) filtra TODAS las categorías, patrón
+  `($N::text IS NULL OR company_id = $N)` (nunca concatenación). Cada item
+  devuelve `company_id`.
+- `listar_companias=true`: compañías reales + conteo de clientes, sin
+  tocar ninguna otra categoría.
+- Paginación real: `offset` (default 0), `limite` hasta 2000 (antes tope
+  500 fijo), respuesta con `total`/`offset`/`limite`/`hay_mas`.
+  `formato_salida='resumen_por_tipo'`: solo conteos, sin `items`.
+- `coordenadas`: 10 subtipos (`tipo_problema` filtra a uno). Nuevos:
+  SOLO_LATITUD/SOLO_LONGITUD (antes colapsaban en NULA),
+  LAT_LON_INVERTIDAS (lat cae en rango de longitud de Ecuador y viceversa
+  — columnas cruzadas), LAT_IGUAL_LON, FORMATO_INVALIDO, BAJA_PRECISION
+  (ver hallazgos arriba). Rango válido ampliado (incluye Galápagos,
+  marcado con `en_galapagos`). Cada item trae contexto (`ultima_compra`,
+  `dias_desde_ultima`, `ruta`+`grupo` del documento MÁS RECIENTE real —
+  mismo patrón exacto que `clientesSinVisita.js` — `ventas_12m`,
+  `telefono`, `ciudad`, `fecha_creacion`), ordenado por `ventas_12m`
+  descendente, filtrable con `solo_activos_dias`.
+- `duplicados` — de 2 señales a 7:
+  1. `senal_fuerte` (igual que antes: RUC+company_id+nombre EXACTO).
+  2. `senal_fuerte_normalizada` (NUEVA): mismo RUC, nombres EXACTOS
+     distintos pero IDÉNTICOS tras normalizar (mayúsculas, `unaccent`,
+     sin puntuación, sin sufijo societario SA/SAS/CIA LTDA/CA vía regex
+     `\y...\y` de Postgres) — ej. "S.A" vs "S.A.". Antes cualquiera de
+     estos caía en `senal_debil` sin distinguirlo de una ambigüedad de
+     negocio real.
+  3. `senal_debil` (igual criterio que antes, pero AHORA excluye los
+     casos que se movieron a `senal_fuerte_normalizada`).
+  4. `equivalencia_cedula_ruc` (NUEVA): cédula de 10 dígitos y RUC de
+     esos mismos 10 + "001" bajo `codigo_cliente` DISTINTOS — el chequeo
+     de RUC exacto nunca los agarra porque el valor crudo difiere.
+     Ejemplos reales confirmados antes de construir (ver investigación
+     en el propio código).
+  5. `mismo_telefono` (NUEVA): mismo teléfono (normalizado: solo dígitos,
+     sin prefijo 593/0, mínimo 7 dígitos para evitar valores genéricos)
+     bajo RUC distinto + nombre con `similarity()` > 0.85 — self-join en
+     SQL, sin loops en JS.
+  6. `mismo_pin` (NUEVA): misma coordenada EXACTA (no nula, no (0,0), no
+     ya cubierta por PIN_POR_DEFECTO de >5 clientes) bajo RUC distinto +
+     nombre similar > 0.85.
+  7. `nombres_problematicos` (NUEVA): `nombre_cliente` nulo o con
+     espacios/saltos de línea al borde (antes de cualquier
+     normalización) — 590 casos reales.
+  Cada grupo trae `detalle` por código (nombre, `origen_codigo`
+  NUMERICO/GA/CL, `fecha_creacion`, `ultima_compra`, `ventas_12m`,
+  `ruta`, `telefono`, coordenadas) y `sugerencia_maestro` (el código con
+  más `ventas_12m` del grupo — SOLO sugerencia, nunca una acción).
+  `incluir_cadenas=true` lista también las cadenas grandes normalmente
+  excluidas de `senal_debil`.
+
+### Bug encontrado y corregido DURANTE la construcción (antes de dar por buena la tool)
+
+`senal_debil.total` usaba accidentalmente el largo de la lista YA
+excluida de cadenas grandes (`senalDebilItems`, post-filtro de listado)
+en vez del total genuino de grupos (`debilGenuino`, antes de esa
+exclusión) — detectado comparando contra una query SQL independiente
+corrida a mano: el total esperado (universo completo mismo-RUC-nombres-
+distintos, 517 con datos de hoy) tenía que repartirse EXACTO entre
+`senal_debil` + `senal_fuerte_normalizada`, y daba 477 en vez de 517 (un
+hueco de 40, exactamente el número de cadenas grandes excluidas del
+listado). Corregido separando `total` (siempre el universo genuino) de
+`items` (lo efectivamente paginable, que sí respeta la exclusión de
+cadenas) — `paginar()` ahora acepta un `totalReal` opcional, y `hay_mas`
+se calcula contra el largo real de `items`, no contra `totalReal` (para
+no decir "hay más" cuando lo que resta son grupos excluidos, no una
+página siguiente real).
+
+### Validación con datos reales — comparación contra el baseline pedido
+
+Rango: base completa (sin `company_id`) vs. `company_id=1`. El baseline
+citado (2646 coordenadas / 983 fuerte / 516 débil) fue medido hace
+semanas — con datos de HOY, la misma lógica vieja da 2647*/984/517
+(*antes de sumar las categorías nuevas) — drift de 1-2, normal en una
+base viva, no una regresión.
+
+| | Sin filtro (toda la base) | `company_id=1` (GRUPOAQUA) |
+|---|---|---|
+| coordenadas (total, 10 tipos) | 2,725 | 2,410 |
+| — de eso, equivalente a categorías viejas (NULA+SOLO_LAT+SOLO_LON+CERO_CERO+PIN_DEFECTO+FUERA_RANGO) | 2,647 | — |
+| — nuevas (BAJA_PRECISION+LAT_IGUAL_LON) | 78 | — |
+| duplicados.senal_fuerte | 984 | 968 |
+| duplicados.senal_fuerte_normalizada (nueva, salió de debil) | 52 | 18 |
+| duplicados.senal_debil (ya sin los normalizados) | 465 | 376 |
+| duplicados.equivalencia_cedula_ruc (nueva) | 146 | 102 |
+| duplicados.mismo_telefono (nueva) | 50 | 44 |
+| duplicados.mismo_pin (nueva) | 18 | 18 |
+| duplicados.nombres_problematicos (nueva) | 590 | 482 |
+
+`listar_companias`: 1=GRUPOAQUA S.A. (17,533), NULL (2,340), 5=DISTRINTER
+(312), 3=COTTSA (282), 4=IIBC S.A. (33), 2=AQUASUPPLY S.A. (20) — suma
+exacta al total de `clientes` (20,520 al momento de la prueba).
+
+### Validación técnica (suite completa, `node:20-alpine`)
+
+`seguridad-smoke-test` OK (inyección en `company_id` probada —
+`"1'; DROP TABLE clientes; --"` no rompe nada, tabla intacta),
+`oauth-smoke-test` OK (17 tools, sin cambios — esta tarea amplía una tool
+existente, no registra ninguna nueva), `ventasPorCondicionPago-real` OK,
+`clasificacionRutaCombinada-real` OK, `clasificacionDomicilioEquipo-real`
+OK (sin regresión en nada fuera de `auditoriaClientes`, como se pidió).
+`auditoriaClientes-real` (el test viejo) actualizado en 1 sola aserción
+(la partición nueva de `senal_debil`, documentado inline por qué) y en
+verde. Nuevo `auditoriaClientesAmpliacion-real.test.js` (24 aserciones,
+incluye la regresión del bug de arriba) en verde.
+
+### Fuera de alcance / decisiones explícitas
+
+No se tocó ninguna otra tool (`clientesSinVisita`, `clientesSinConsumo`,
+etc.), confirmado por grep — solo se REUTILIZARON `CASE_GRUPO_ORDENES`/
+`CASE_GRUPO_FACTURAS` de `clasificacion.js`, nunca se copiaron ni
+reescribieron. No se agregó campo `provincia` (pedido en el mensaje
+original) — ni `clientes` ni `direcciones_clientes` tienen esa columna;
+se expone `ciudad_cliente` tal cual existe, sin inventar un campo que no
+está en los datos. `dashboard_backend`/`mcp_server` **no se
+redesplegaron** — pendiente de que el usuario revise el diff y autorice.
