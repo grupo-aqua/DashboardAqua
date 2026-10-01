@@ -5678,3 +5678,90 @@ key de una tabla compartida por 8+ tools). Una vez aprobado el enfoque
 (llave de reconciliación + qué hacer con los 753 pares existentes), se
 implementa en un PR aparte, con su propio plan de rollback dado que
 toca una tabla en producción activamente escrita 2x al día.
+
+## 🚨 Medición urgente — impacto real en `resumenDiario` (reporte semanal a CIRE) — 2026-10-01, SOLO MEDICIÓN, sin fix
+
+Pedido explícito del usuario, con prioridad sobre el resto del diseño
+de arriba: `resumenDiario.js` alimenta el reporte semanal que se le
+manda a CIRE — hay que saber si los números ya comunicados están
+inflados, por cuánto, y desde cuándo, antes de seguir resolviendo la
+llave de reconciliación.
+
+### Metodología
+
+Se reconstruyó exactamente `SQL_DIA` de `resumenDiario.js` (mismo
+`CASE_GRUPO_ORDENES`/`CASE_GRUPO_FACTURAS`/`FILTRO_ORDENES_GRUPO_VALIDO`/
+`FILTRO_CLIENTE_VALIDO`/`GRUPOS_VALIDOS` importados del mismo
+`clasificacion.js`, no reescritos a mano) agregada por semana calendario
+(lunes-domingo) en vez de por día, y se corrió 2 veces por semana: una
+tal cual (CON duplicados) y otra agregando la misma condición de
+exclusión ya validada en el PR #12 (`facturas_dedup`: excluye la fila
+con `tipo_movimiento` vacío cuando existe una gemela con mismo
+customer_code+día+total exacto y `tipo_movimiento` poblado). La
+diferencia entre ambas es el monto exacto que `resumenDiario` está
+sobrecontando por semana. Las 6 semanas elegidas son las últimas 6
+semanas calendario YA CERRADAS antes de hoy (jueves 2026-10-01) — la
+última semana completa termina el domingo 2026-09-27.
+
+### 1) Monto exacto de la diferencia, semana por semana
+
+| Semana (lun-dom) | CON duplicados | SIN duplicados | Diferencia | % |
+|---|---|---|---|---|
+| 17-23 ago | $220,800.65 | $220,800.65 | **$0.00** | 0.000% |
+| 24-30 ago | $216,700.50 | $216,616.85 | **$83.65** | 0.039% |
+| 31 ago-6 sep | $251,637.02 | $251,541.58 | **$95.44** | 0.038% |
+| 7-13 sep | $248,413.59 | $247,830.20 | **$583.39** | 0.235% |
+| 14-20 sep | $238,841.80 | $237,850.50 | **$991.30** | 0.415% |
+| **21-27 sep** (última semana ya reportada) | $201,173.66 | $196,099.76 | **$5,073.90** | **2.522%** |
+| **TOTAL 6 semanas** | **$1,377,567.22** | **$1,370,739.54** | **$6,827.68** | **0.496%** |
+
+**Dato adicional, no pedido pero relevante para la decisión**: la
+semana EN CURSO (28-sep a hoy, 2026-10-01, parcial — 4 días, TODAVÍA NO
+reportada) ya acumula **$4,611.31** de diferencia sobre $96,307.93
+(**4.788%**) — más alto que cualquier semana ya cerrada. Esto es
+esperable: la sección de causa raíz de arriba ya documentó que el
+catch-up masivo de MobilVendor se concentró el 28-30 de septiembre, y
+esos días caen en esta semana todavía no reportada.
+
+### 2) ¿Es material?
+
+**Depende de qué se esté mirando.** El acumulado de las 6 semanas
+($6,827.68 sobre $1,377,567.22, 0.496%) es **marginal** — no cambiaría
+ninguna cifra ni decisión basada en el agregado de 6 semanas. PERO la
+cifra NO es estable: crece de $0 a $5,073.90 en 6 semanas, de forma
+acelerada (cada semana más que duplica o triplica a la anterior desde
+el 7-sep en adelante), y la semana más reciente YA REPORTADA
+individualmente (21-27 sep, **2.5%**) y la semana en curso (**4.8%**,
+y todavía no cierra) ya NO son marginales como cifra semanal
+individual — son órdenes de magnitud más grandes que cualquier semana
+de agosto. **La pregunta correcta no es "¿el acumulado importa?" sino
+"¿la tendencia, de seguir así, hace que el próximo reporte (semana
+28-sep al 4-oct) muestre un número significativamente inflado?" — y la
+respuesta con los datos de hoy es que sí probablemente**, dado que ya
+lleva 4.8% de diferencia con solo 4 de 7 días de la semana cerrados.
+
+### 3) Fecha de corte
+
+Confirma exactamente el mismo patrón que el hallazgo original de
+`ventasCliente.js`: **no afecta meses anteriores a septiembre de forma
+significativa.** Agosto completo (las 3 semanas de 17-ago a 6-sep que
+caen mayormente en agosto) está entre $0.00 y $95.44 por semana
+(0.00%-0.04%) — ruido, no un problema real. El quiebre empieza la
+semana del 7-13 de septiembre (0.235%, ya claramente distinto de cero)
+y se acelera cada semana sucesiva hasta la última semana reportada
+(2.522%) y la semana en curso (4.788%, y subiendo). **Es,
+consistentemente con el resto de esta investigación, un problema casi
+exclusivo de septiembre 2026 en adelante — no retroactivo a meses
+anteriores.**
+
+### Recomendación (no es una decisión de negocio, es solo para que el usuario decida con cifras exactas)
+
+No se tocó `resumenDiario.js` ni ningún otro código — esto es solo
+medición, tal como se pidió. Con estos números: el reporte YA enviado
+de la semana 21-27 sep tiene ~$5,074 de más (2.5%) que no debería estar
+ahí; si el reporte de la semana en curso (28-sep al 4-oct) se envía sin
+corregir, la proyección con los 4 días ya medidos sugiere que podría
+estar en el rango de $4,600-$9,000+ de más, dependiendo del
+comportamiento de los próximos 3 días. Queda a criterio del usuario si
+eso amerita un aviso a CIRE antes de que se cierre y envíe esa semana,
+independientemente de cuándo se resuelva la llave técnica de fondo.
