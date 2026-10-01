@@ -61,6 +61,7 @@ const {
   FILTRO_PREVENTA_SELLER,
   CATEGORIA_PREVENTA,
   FILTRO_CLIENTE_VALIDO,
+  FILTRO_FACTURAS_NO_DUPLICADO,
   CONDICION_PAGO_CLIENTE,
   FUENTE_CONDICION_PAGO_CLIENTE,
   CONDICION_PAGO_FACTURA,
@@ -115,6 +116,7 @@ const SQL = `
     WHERE f.status = 2
       AND (${CASE_GRUPO_FACTURAS}) = $1
       AND ${FILTRO_CLIENTE_VALIDO("f.customer_code")}
+      AND ${FILTRO_FACTURAS_NO_DUPLICADO("f")}
       AND f.fecha_creacion >= $2
       AND f.fecha_creacion <  $3
       AND ($4::text IS NULL OR dd.descripcion_categoria = $4)
@@ -222,6 +224,7 @@ const SQL_SIN_DATO_CLIENTES = `
     WHERE f.status = 2
       AND (${CASE_GRUPO_FACTURAS}) = $1
       AND ${FILTRO_CLIENTE_VALIDO("f.customer_code")}
+      AND ${FILTRO_FACTURAS_NO_DUPLICADO("f")}
       AND f.fecha_creacion >= $2
       AND f.fecha_creacion <  $3
       AND ($4::text IS NULL OR dd.descripcion_categoria = $4)

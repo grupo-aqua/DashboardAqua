@@ -271,6 +271,19 @@ const CODIGOS_CLIENTE_GENERICOS = ["8", "9"];
 const FILTRO_CLIENTE_VALIDO = (aliasCustomerCode) =>
   `${aliasCustomerCode} NOT IN ('${CODIGOS_CLIENTE_GENERICOS.join("', '")}')`;
 
+// Reconciliación MobilVendor↔Odoo (2026-10-01, ver TODO.md: "Propuesta de
+// diseño COMPLETA — reconciliación de facturas"). El sync de MobilVendor y
+// el de Odoo escriben, cada uno por su lado, una fila de `facturas` para la
+// misma venta real cuando el `code` que reporta cada sistema no coincide —
+// `duplicado_de` marca (sin borrar) la fila que NO debe contar. Todas las
+// tools que suman `facturas` (join con `detalle_documento` o no) deben
+// agregar esta condición a su WHERE sobre el alias de `facturas` (`f` en
+// todas las tools existentes) — un solo lugar centraliza el fix para las 8
+// tools afectadas (ver TODO.md para la lista completa y su exposición
+// individual) en vez de repetir la lógica de detección en cada una.
+const FILTRO_FACTURAS_NO_DUPLICADO = (aliasFacturas) =>
+  `${aliasFacturas}.duplicado_de IS NULL`;
+
 // ============================================================
 // Condición de pago (CONTADO/CREDITO) — investigado 2026-09-15/16. Alberto
 // corrigió la vieja asunción "contado=MobilVendor / crédito=Odoo": esa
@@ -426,6 +439,7 @@ module.exports = {
   CATEGORIA_PREVENTA,
   CODIGOS_CLIENTE_GENERICOS,
   FILTRO_CLIENTE_VALIDO,
+  FILTRO_FACTURAS_NO_DUPLICADO,
   CONDICION_PAGO_CLIENTE,
   FUENTE_CONDICION_PAGO_CLIENTE,
   CONDICION_PAGO_FACTURA,

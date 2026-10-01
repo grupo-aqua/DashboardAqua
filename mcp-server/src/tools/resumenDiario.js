@@ -8,6 +8,7 @@ const {
   CASE_GRUPO_FACTURAS,
   GRUPOS_VALIDOS,
   FILTRO_CLIENTE_VALIDO,
+  FILTRO_FACTURAS_NO_DUPLICADO,
 } = require("../sql/clasificacion");
 
 const TOP_RUTAS_LIMITE = 10;
@@ -49,6 +50,7 @@ const SQL_DIA = `
     FROM facturas f
     JOIN detalle_documento dd ON dd.documento_code = f.code
     WHERE f.status = 2
+      AND ${FILTRO_FACTURAS_NO_DUPLICADO("f")}
       AND ${FILTRO_CLIENTE_VALIDO("f.customer_code")}
       AND f.fecha_creacion >= $1
       AND f.fecha_creacion <  $2
@@ -92,6 +94,7 @@ const SQL_NUM_DOCUMENTOS = `
     FROM facturas f
     JOIN detalle_documento dd ON dd.documento_code = f.code
     WHERE f.status = 2
+      AND ${FILTRO_FACTURAS_NO_DUPLICADO("f")}
       AND ${FILTRO_CLIENTE_VALIDO("f.customer_code")}
       AND f.fecha_creacion >= $1
       AND f.fecha_creacion <  $2

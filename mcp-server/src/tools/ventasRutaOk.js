@@ -55,7 +55,7 @@
 const { z } = require("zod");
 const { pool } = require("../db");
 const { finExclusivo, diffDias } = require("../util/fechas");
-const { FILTRO_CLIENTE_VALIDO } = require("../sql/clasificacion");
+const { FILTRO_CLIENTE_VALIDO, FILTRO_FACTURAS_NO_DUPLICADO } = require("../sql/clasificacion");
 const { executeKw } = require("../integrations/aquaPremiumNe");
 
 const MAX_RANGO_DIAS = 400;
@@ -95,6 +95,7 @@ const SQL_COTTSA = `
   LEFT JOIN clientes c ON c.codigo_cliente = f.customer_code
   WHERE f.seller_code = ANY($1::text[])
     AND f.status = 2
+    AND ${FILTRO_FACTURAS_NO_DUPLICADO("f")}
     AND ${FILTRO_CLIENTE_VALIDO("f.customer_code")}
     AND f.fecha_creacion >= $2
     AND f.fecha_creacion <  $3

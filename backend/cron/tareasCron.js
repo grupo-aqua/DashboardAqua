@@ -11,6 +11,7 @@ const { sincronizarOdooCompletoRango } = require('../services/odooServicio/sincr
 const { sincronizarRutasYDetalles }    = require('../services/syncRouteDetailsService');
 const { obtenerHistorialDeUsuarios }   = require('../services/syncHistorialVisitasService');
 const { sincronizarParadasFlota }      = require('../services/vigiloServicio/sincronizacionVigiloService');
+const { marcarFacturasDuplicadas }     = require('../services/reconciliacionFacturasService');
 
 // ================================================================
 // LOGGING
@@ -71,6 +72,7 @@ async function ejecutarSincronizacion(label, startDate, endDate) {
     rutas       : null,
     visitas     : null,
     promos      : null,
+    duplicados  : null,
   };
 
   // ── 1. MobilVendor + Odoo en paralelo ───────────────────────
@@ -131,6 +133,24 @@ async function ejecutarSincronizacion(label, startDate, endDate) {
     log(`[Promos]      ${resultados.promos}`, 'ERROR');
   }
 
+  // ── 5. Reconciliación de facturas duplicadas MobilVendor↔Odoo (Tier 2,
+  //       ver TODO.md: "Propuesta de diseño COMPLETA — reconciliación de
+  //       facturas") — corre DESPUÉS de MobilVendor+Odoo (necesita que
+  //       ambos ya hayan escrito su versión del documento). Idempotente
+  //       (solo toca filas con duplicado_de todavía NULL), así que corre en
+  //       los 2 ciclos diarios (00:00 y 12:00) sin problema — eso además
+  //       reduce a ~12h el tiempo máximo que un duplicado nuevo queda sin
+  //       marcar, en vez de esperar 24h.
+  log('[Duplicados] Iniciando reconciliación de facturas...');
+  try {
+    const r = await marcarFacturasDuplicadas();
+    resultados.duplicados = `OK (${r.marcados} marcados, ${r.promosReapuntadas} promos reapuntadas, ${r.aRevisionManual} a revisión manual)`;
+    log(`[Duplicados]  ${resultados.duplicados}`);
+  } catch (e) {
+    resultados.duplicados = `ERROR: ${e.message ?? 'desconocido'}`;
+    log(`[Duplicados]  ${resultados.duplicados}`, 'ERROR');
+  }
+
   // ── Resumen final ────────────────────────────────────────────
   const duracion   = ((Date.now() - inicio) / 1000).toFixed(1);
   const hayErrores = Object.values(resultados).some(v => v && v.startsWith('ERROR'));
@@ -142,6 +162,7 @@ async function ejecutarSincronizacion(label, startDate, endDate) {
   log(`  Rutas       : ${resultados.rutas}`);
   log(`  Visitas     : ${resultados.visitas}`);
   log(`  Promos      : ${resultados.promos}`);
+  log(`  Duplicados  : ${resultados.duplicados}`);
   log('='.repeat(65) + '\n');
 
   isRunning = false;
