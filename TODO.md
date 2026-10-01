@@ -5158,3 +5158,94 @@ NO se desplegó `dashboard_backend` con este cambio (cron nuevo incluido)
 sección se probó copiando el código al contenedor vivo sin reiniciarlo,
 por la misma disciplina de esta sesión de no redesplegar `dashboard_backend`
 sin autorización explícita aparte.
+
+## 🐛✅ Fix: `ventasCliente` sobrecontaba unidades/dólares por documentos duplicados en `facturas` (reportado por Kenny Navas, bodega, vía Slack, 2026-10-01)
+
+### El reporte y la causa (ver también el PR #11 de `auditoriaClientes`, donde se investigó esto por primera vez junto con otro bug — acá queda el detalle completo y el fix)
+
+Caso real: cliente MUÑOZ TABAREZ PAUL LENIN (`codigo_cliente=228561`),
+producto BOTELLÓN 20L AQUA PREMIUM (LIQUÍDO) (`codigo_producto=28`),
+septiembre 2026. El MCP devolvía $5,990.68 / 3,990 unidades — Kenny había
+contado a mano 3,235 unidades brutas (3,110 netas tras restar 125u de una
+regalía en $0, que nunca fue parte de este bug).
+
+**Hipótesis descartada con evidencia** (pedido explícito: revisar
+primero): ¿cliente duplicado por RUC? NO — el RUC `0917064057` tiene
+exactamente 1 fila en `clientes`.
+
+**Causa real, reconciliada al centavo**: `facturas` tiene documentos
+DUPLICADOS para la misma venta real — mismo `customer_code`+mismo
+día+mismo `total` EXACTO, un código con `tipo_movimiento` poblado (ej.
+`FA001-106-000000142`) y un "gemelo" con `tipo_movimiento` vacío (ej.
+`FAM6-000135`). `SQL_HISTORIAL` sumaba ambos como si fueran 2 ventas.
+
+### El fix — deduplicación CONSCIENTE DEL GEMELO, no por prefijo de código
+
+Investigado antes de tocar código: de los documentos con `tipo_movimiento`
+vacío, NO todos tienen un gemelo duplicado — algunos son la ÚNICA
+representación real de esa venta (confirmado con el caso original: ~11 de
+37 documentos `FAM#` no tenían gemelo). Excluir por prefijo de código a
+ciegas hubiera borrado ingresos reales.
+
+**Implementado en `SQL_HISTORIAL`** (`mcp-server/src/tools/ventasCliente.js`):
+nueva CTE `facturas_dedup` que descarta una fila de `facturas` SOLO
+cuando: (a) su `tipo_movimiento` está vacío, Y (b) existe OTRA fila del
+MISMO `customer_code` + MISMO día (`fecha_creacion::date`) + MISMO
+`total` EXACTO con `tipo_movimiento` poblado. Nunca descarta una fila con
+`tipo_movimiento` poblado (así que 2 ventas reales coincidentes del mismo
+cliente/día/monto, ambas con tipo_movimiento poblado, nunca se tocan — no
+hay forma de que esto sea un duplicado según el patrón real encontrado).
+`SQL_NOTAS_CREDITO` no necesitó cambios — exige `tipo_movimiento =
+'out_refund'` (siempre poblado), estructuralmente inmune a este patrón.
+
+### Validación con el caso real exacto
+
+```
+ANTES:   3,990 unidades / $5,990.68
+DESPUÉS: 3,235 unidades / $4,820.44  ← coincide EXACTO con lo que contó Kenny a mano
+3,235 - 125 (regalía $0, sin tocar) = 3,110 netas  ← también exacto
+```
+
+### 🚨 Hallazgo al cuantificar el impacto del fix — el problema es MÁS GRANDE de lo estimado y está ESCALANDO RÁPIDO (para revisar después, no bloqueó este fix)
+
+El caso de Kenny usó el patrón `FAM#` (37 documentos conocidos) para
+encontrar la causa, pero la regla de deduplicación real (customer+día+
+monto exacto, sin importar el prefijo del código) atrapa un universo
+MUCHO más grande:
+
+```sql
+-- documentos excluidos por la nueva regla, sistema completo:
+743 documentos, $16,707.01 total
+  2025-05: 1 doc,   $0.54
+  2026-08: 40 docs, $1,425.84
+  2026-09: 702 docs, $15,280.63   ← 94.5% del total, en UN solo mes
+```
+
+De 40 documentos en agosto a 702 en septiembre — un salto de ~17.5x en un
+mes. Esto es un problema de SYNC activo y empeorando rápido, no un
+artefacto histórico estable. **No se investigó la causa de fondo** (por
+qué `sincronizacionService.js`/el flujo de Odoo está generando 2
+documentos para la misma venta) — pedido explícito del usuario de no
+desviarse a eso ahora, queda anotado acá para revisar aparte, con
+urgencia dado el ritmo de crecimiento.
+
+### Validación técnica
+
+`seguridad-smoke-test` OK, `oauth-smoke-test` OK (17 tools, sin cambios
+— este fix no registra tools nuevas), `notasCredito-real.test.js` sigue
+con el mismo drift de datos preexistente YA CONOCIDO (confirmado
+corriendo el mismo test contra el `ventasCliente.js` SIN el fix — falla
+exacto igual, -$316,613.12 en ambos casos — no es una regresión de este
+cambio). Nuevo `ventasClienteFacturasDuplicadas-real.test.js` (8
+aserciones, incluye sanity check de que el par de documentos gemelos
+original sigue existiendo) en verde.
+
+### Fuera de alcance, decisión explícita
+
+Solo se tocó `ventasCliente.js`, pedido explícito del usuario ("no lo
+mezcles con el #11"). El mismo patrón de duplicación probablemente
+afecta OTRAS tools que suman `facturas` sin deduplicar (`ventasPorGrupo`,
+`ventasPorCondicionPago`, `resumenDiario`, etc.) — NO se tocaron, fuera
+de alcance de este fix puntual. La causa de fondo en el sync tampoco se
+investigó (ver hallazgo de arriba) — ambas cosas quedan como trabajo
+futuro, no bloquean este fix.
