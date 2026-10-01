@@ -134,6 +134,37 @@ function origenCodigo(codigo) {
 }
 
 // ============================================================
+// Estado en Odoo (res.partner.active) — reportado 2026-10-01 (Kenny Navas,
+// vía Slack): ninguna categoría de esta tool fuera de `activos_sin_consumo`
+// distinguía archivados de activos, pese a que la lista de `coordenadas`
+// sospechosas también alimenta `auditoriaParadasFlota`. Confirmado antes de
+// corregir: `direcciones_incompletas`, `coordenadas`, `duplicados` (las 7
+// señales) y `sin_canal` NO tocaban Odoo en absoluto — `grep` de
+// `fetchOdooActivoPorRuc`/`res.partner` en el código ANTES de este cambio
+// solo aparecía en `activos_sin_consumo`.
+//
+// Pedido explícito: NO excluir archivados (esta sigue siendo Fase 1,
+// diagnóstico puro) — separar el conteo activo/archivado por categoría,
+// mismo criterio que ya usa `activos_sin_consumo`. `activoOdooPorRuc` se
+// trae UNA sola vez por llamada a `auditoriaClientes()` (antes se hubiera
+// llamado 2 veces en el resumen sin categoría: acá + adentro de
+// activos_sin_consumo) y se pasa a cada categoría que la necesite.
+function clasificarActivoOdoo(ruc, activoOdooPorRuc) {
+  if (!ruc) return "SIN_RUC";
+  if (!activoOdooPorRuc.has(ruc)) return "SIN_MATCH_ODOO";
+  return activoOdooPorRuc.get(ruc) ? "ACTIVO" : "ARCHIVADO";
+}
+
+function porEstadoOdoo(items, obtenerRuc, activoOdooPorRuc) {
+  const conteo = { ACTIVO: 0, ARCHIVADO: 0, SIN_MATCH_ODOO: 0, SIN_RUC: 0 };
+  for (const it of items) {
+    const estado = clasificarActivoOdoo(obtenerRuc(it), activoOdooPorRuc);
+    conteo[estado]++;
+  }
+  return conteo;
+}
+
+// ============================================================
 // listar_companias — 100% Postgres, no toca Odoo (ver hallazgo arriba).
 // ============================================================
 async function listarCompanias() {
@@ -200,8 +231,9 @@ const SQL_VENTAS_12M = `
 
 // Devuelve Map(codigo_cliente -> contexto). `codigos` puede venir con
 // duplicados (varios grupos de duplicados comparten códigos) — se
-// deduplica antes de consultar.
-async function enriquecerClientes(codigos) {
+// deduplica antes de consultar. `activoOdooPorRuc` es opcional — cuando se
+// pasa, cada registro trae `activo_odoo` (ver clasificarActivoOdoo).
+async function enriquecerClientes(codigos, activoOdooPorRuc) {
   const unicos = [...new Set(codigos.filter(Boolean))];
   const mapa = new Map();
   if (unicos.length === 0) return mapa;
@@ -214,7 +246,7 @@ async function enriquecerClientes(codigos) {
   const [clientesRes, rutaGrupoRes, ventasRes, ultimaRes] = await Promise.all([
     pool.query(
       `SELECT codigo_cliente, nombre_cliente, nombre_comercial_cliente, telefono_cliente, ciudad_cliente,
-              fecha_creacion_cliente, company_id
+              fecha_creacion_cliente, company_id, TRIM(identificacion_cliente) AS ruc
        FROM clientes WHERE codigo_cliente = ANY($1::text[])`,
       [unicos]
     ),
@@ -246,6 +278,7 @@ async function enriquecerClientes(codigos) {
       ultima_compra: ultimaDia ? ultimaDia.toISOString().slice(0, 10) : null,
       dias_desde_ultima: dias,
       origen_codigo: origenCodigo(c.codigo_cliente),
+      ...(activoOdooPorRuc ? { activo_odoo: clasificarActivoOdoo(c.ruc, activoOdooPorRuc) } : {}),
     });
   }
   return mapa;
@@ -258,7 +291,7 @@ function sqlDireccionesIncompletas() {
   return `
     SELECT dc.codigo_cliente, dc.codigo_direccion_cliente, dc.descripcion_direccion_cliente,
            dc.referencia_direccion_cliente, dc.telefono_direccion_cliente,
-           c.nombre_cliente, c.nombre_comercial_cliente, c.company_id
+           c.nombre_cliente, c.nombre_comercial_cliente, c.company_id, TRIM(c.identificacion_cliente) AS ruc
     FROM direcciones_clientes dc
     JOIN clientes c ON c.codigo_cliente = dc.codigo_cliente
     WHERE dc.estado_direccion_cliente = 1
@@ -269,15 +302,16 @@ function sqlDireccionesIncompletas() {
   `;
 }
 
-async function auditarDireccionesIncompletas(companyId, offset, limite, formatoSalida) {
+async function auditarDireccionesIncompletas(companyId, offset, limite, formatoSalida, activoOdooPorRuc) {
   const { rows } = await pool.query(sqlDireccionesIncompletas(), [companyId || null]);
   if (formatoSalida === "resumen_por_tipo") {
-    return { total: rows.length };
+    return { total: rows.length, por_estado_odoo: porEstadoOdoo(rows, (r) => r.ruc, activoOdooPorRuc) };
   }
   const items = rows.map((r) => ({
     codigo_cliente: r.codigo_cliente,
     nombre_cliente: nombreCliente(r),
     company_id: r.company_id,
+    activo_odoo: clasificarActivoOdoo(r.ruc, activoOdooPorRuc),
     codigo_direccion: r.codigo_direccion_cliente,
     descripcion_direccion: r.descripcion_direccion_cliente || null,
     campos_faltantes: [
@@ -286,7 +320,7 @@ async function auditarDireccionesIncompletas(companyId, offset, limite, formatoS
       ...(!r.telefono_direccion_cliente || !r.telefono_direccion_cliente.trim() ? ["telefono"] : []),
     ],
   }));
-  return paginar(items, offset, limite);
+  return { ...paginar(items, offset, limite), por_estado_odoo: porEstadoOdoo(rows, (r) => r.ruc, activoOdooPorRuc) };
 }
 
 // ============================================================
@@ -296,7 +330,7 @@ function sqlDireccionesCoord() {
   return `
     SELECT dc.codigo_cliente, dc.codigo_direccion_cliente,
            dc.latitud_direccion_cliente::text AS lat_texto, dc.longitud_direccion_cliente::text AS lon_texto,
-           c.nombre_cliente, c.nombre_comercial_cliente, c.company_id
+           c.nombre_cliente, c.nombre_comercial_cliente, c.company_id, TRIM(c.identificacion_cliente) AS ruc
     FROM direcciones_clientes dc
     JOIN clientes c ON c.codigo_cliente = dc.codigo_cliente
     WHERE dc.estado_direccion_cliente = 1
@@ -347,7 +381,7 @@ function clasificarCoordenada(latTexto, lonTexto) {
   return { problema: null, en_galapagos: enGalapagos };
 }
 
-async function auditarCoordenadas(companyId, tipoProblema, offset, limite, formatoSalida, soloActivosDias) {
+async function auditarCoordenadas(companyId, tipoProblema, offset, limite, formatoSalida, soloActivosDias, activoOdooPorRuc) {
   const { rows } = await pool.query(sqlDireccionesCoord(), [companyId || null]);
 
   // Pines por defecto: misma coordenada EXACTA repetida en muchos clientes
@@ -375,6 +409,7 @@ async function auditarCoordenadas(companyId, tipoProblema, offset, limite, forma
       codigo_cliente: r.codigo_cliente,
       nombre_cliente: nombreCliente(r),
       company_id: r.company_id,
+      ruc: r.ruc,
       codigo_direccion: r.codigo_direccion_cliente,
       problema,
       latitud: lat,
@@ -389,18 +424,26 @@ async function auditarCoordenadas(companyId, tipoProblema, offset, limite, forma
   if (formatoSalida === "resumen_por_tipo") {
     const conteos = {};
     for (const c of candidatos) conteos[c.problema] = (conteos[c.problema] || 0) + 1;
-    return { total: candidatos.length, por_tipo: conteos };
+    return { total: candidatos.length, por_tipo: conteos, por_estado_odoo: porEstadoOdoo(candidatos, (c) => c.ruc, activoOdooPorRuc) };
   }
 
-  const contexto = await enriquecerClientes(candidatos.map((c) => c.codigo_cliente));
-  let items = candidatos.map((c) => ({ ...c, ...(contexto.get(c.codigo_cliente) || {}) }));
+  const contexto = await enriquecerClientes(candidatos.map((c) => c.codigo_cliente), activoOdooPorRuc);
+  let items = candidatos.map((c) => {
+    const { ruc, ...resto } = c;
+    return { ...resto, ...(contexto.get(c.codigo_cliente) || {}) };
+  });
 
   if (soloActivosDias) {
     items = items.filter((i) => i.dias_desde_ultima !== null && i.dias_desde_ultima !== undefined && i.dias_desde_ultima <= soloActivosDias);
   }
   items.sort((a, b) => (b.ventas_12m || 0) - (a.ventas_12m || 0));
 
-  return paginar(items, offset, limite);
+  // `items` ya trae `activo_odoo` calculado por `enriquecerClientes` — se
+  // cuenta directo por ese campo, sin volver a clasificar por RUC.
+  const conteoOdoo = { ACTIVO: 0, ARCHIVADO: 0, SIN_MATCH_ODOO: 0, SIN_RUC: 0 };
+  for (const it of items) conteoOdoo[it.activo_odoo || "SIN_RUC"]++;
+
+  return { ...paginar(items, offset, limite), por_estado_odoo: conteoOdoo };
 }
 
 // ============================================================
@@ -538,7 +581,7 @@ function sqlMismoPin() {
 
 function sqlNombresProblematicos() {
   return `
-    SELECT codigo_cliente, nombre_cliente, company_id
+    SELECT codigo_cliente, nombre_cliente, company_id, TRIM(identificacion_cliente) AS ruc
     FROM clientes
     WHERE ($1::text IS NULL OR company_id = $1)
       AND (nombre_cliente IS NULL OR nombre_cliente <> TRIM(nombre_cliente) OR nombre_cliente ~ E'[\\n\\r]')
@@ -572,7 +615,24 @@ function detalleCodigos(codigos, contexto) {
   return { detalle, sugerencia_maestro: sugerenciaMaestro };
 }
 
-async function auditarDuplicados(companyId, offset, limite, formatoSalida, incluirCadenas) {
+// Cuenta por estado Odoo a nivel de CÓDIGO (no de grupo) — un grupo puede
+// mezclar códigos activos y archivados, así que la señal útil es cuántos
+// códigos individuales caen en cada estado, igual que en coordenadas.
+function porEstadoOdooCodigos(gruposODocs, obtenerCodigos, contexto) {
+  const conteo = { ACTIVO: 0, ARCHIVADO: 0, SIN_MATCH_ODOO: 0, SIN_RUC: 0 };
+  const codigosVistos = new Set();
+  for (const item of gruposODocs) {
+    for (const cod of obtenerCodigos(item)) {
+      if (codigosVistos.has(cod)) continue;
+      codigosVistos.add(cod);
+      const estado = contexto.get(cod)?.activo_odoo || "SIN_RUC";
+      conteo[estado]++;
+    }
+  }
+  return conteo;
+}
+
+async function auditarDuplicados(companyId, offset, limite, formatoSalida, incluirCadenas, activoOdooPorRuc) {
   const [fuerteRes, debilRes, equivRes, telRes, pinRes, nombresProbRes] = await Promise.all([
     pool.query(sqlDuplicadosFuerte(), [companyId || null]),
     pool.query(sqlDuplicadosDebil(), [companyId || null]),
@@ -616,7 +676,7 @@ async function auditarDuplicados(companyId, offset, limite, formatoSalida, inclu
     ...gruposTelefono.flatMap((g) => g.codigos),
     ...gruposPin.flatMap((g) => g.codigos),
   ];
-  const contexto = await enriquecerClientes(todosCodigos);
+  const contexto = await enriquecerClientes(todosCodigos, activoOdooPorRuc);
 
   function ventasMaxGrupo(codigos) {
     return codigos.reduce((max, cod) => Math.max(max, contexto.get(cod)?.ventas_12m || 0), 0);
@@ -648,13 +708,17 @@ async function auditarDuplicados(companyId, offset, limite, formatoSalida, inclu
 
   if (formatoSalida === "resumen_por_tipo") {
     return {
-      senal_fuerte: { total: senalFuerteItems.length },
-      senal_fuerte_normalizada: { total: senalFuerteNormalizadaItems.length },
-      senal_debil: { total: debilGenuino.length, cadenas_grandes_excluidas_del_listado: incluirCadenas ? 0 : cadenasGrandesExcluidas },
-      equivalencia_cedula_ruc: { total: equivalenciaItems.length },
-      mismo_telefono: { total: telefonoItems.length },
-      mismo_pin: { total: pinItems.length },
-      nombres_problematicos: { total: nombresProbRes.rows.length },
+      senal_fuerte: { total: senalFuerteItems.length, por_estado_odoo: porEstadoOdooCodigos(senalFuerteItems, (i) => i.codigos, contexto) },
+      senal_fuerte_normalizada: { total: senalFuerteNormalizadaItems.length, por_estado_odoo: porEstadoOdooCodigos(senalFuerteNormalizadaItems, (i) => i.codigos, contexto) },
+      senal_debil: {
+        total: debilGenuino.length,
+        cadenas_grandes_excluidas_del_listado: incluirCadenas ? 0 : cadenasGrandesExcluidas,
+        por_estado_odoo: porEstadoOdooCodigos(senalDebilItems, (i) => i.codigos, contexto),
+      },
+      equivalencia_cedula_ruc: { total: equivalenciaItems.length, por_estado_odoo: porEstadoOdooCodigos(equivalenciaItems, (i) => i.codigos, contexto) },
+      mismo_telefono: { total: telefonoItems.length, por_estado_odoo: porEstadoOdooCodigos(telefonoItems, (i) => i.codigos, contexto) },
+      mismo_pin: { total: pinItems.length, por_estado_odoo: porEstadoOdooCodigos(pinItems, (i) => i.codigos, contexto) },
+      nombres_problematicos: { total: nombresProbRes.rows.length, por_estado_odoo: porEstadoOdoo(nombresProbRes.rows, (r) => r.ruc, activoOdooPorRuc) },
     };
   }
 
@@ -666,33 +730,45 @@ async function auditarDuplicados(companyId, offset, limite, formatoSalida, inclu
   return {
     senal_fuerte: {
       descripcion: "Mismo RUC+company_id+nombre EXACTO en 2+ codigo_cliente — duplicado real de maestro.",
+      por_estado_odoo: porEstadoOdooCodigos(senalFuerteItems, (i) => i.codigos, contexto),
       ...conDetalle(senalFuerteItems),
     },
     senal_fuerte_normalizada: {
       descripcion: "Mismo RUC, nombres EXACTOS distintos pero IDÉNTICOS tras normalizar (mayúsculas, sin tildes/puntuación, sin sufijo societario) — ej. 'S.A' vs 'S.A.'. Tan confiable como senal_fuerte.",
+      por_estado_odoo: porEstadoOdooCodigos(senalFuerteNormalizadaItems, (i) => i.codigos, contexto),
       ...conDetalle(senalFuerteNormalizadaItems),
     },
     senal_debil: {
       descripcion: `Mismo RUC, nombres DISTINTOS incluso normalizados — puede ser duplicado de verdad o sucursales legítimas (ej. cadenas de tiendas) de la misma empresa. Requiere revisión caso por caso. Se excluyen del LISTADO (no del total) grupos con más de ${UMBRAL_CADENA_GRANDE} nombres distintos salvo que se pida incluir_cadenas=true.`,
       cadenas_grandes_excluidas_del_listado: incluirCadenas ? 0 : cadenasGrandesExcluidas,
+      por_estado_odoo: porEstadoOdooCodigos(senalDebilItems, (i) => i.codigos, contexto),
       ...conDetalle(senalDebilItems, debilGenuino.length),
     },
     equivalencia_cedula_ruc: {
       descripcion: "Mismo número base (10 dígitos) pero uno registrado como cédula y otro como RUC (los mismos 10 + '001') bajo codigo_cliente distintos — el chequeo de RUC exacto nunca los agarra porque el valor crudo difiere.",
+      por_estado_odoo: porEstadoOdooCodigos(equivalenciaItems, (i) => i.codigos, contexto),
       ...conDetalle(equivalenciaItems),
     },
     mismo_telefono: {
       descripcion: `Mismo teléfono (normalizado, ≥${UMBRAL_TELEFONO_DIGITOS_MIN} dígitos) bajo RUC distinto, con nombre con similitud > ${UMBRAL_SIMILITUD_NOMBRE}.`,
+      por_estado_odoo: porEstadoOdooCodigos(telefonoItems, (i) => i.codigos, contexto),
       ...conDetalle(telefonoItems),
     },
     mismo_pin: {
       descripcion: `Misma coordenada EXACTA (no nula, no (0,0), no pin-por-defecto de >5 clientes — ver categoria=coordenadas) bajo RUC distinto, con nombre con similitud > ${UMBRAL_SIMILITUD_NOMBRE}.`,
+      por_estado_odoo: porEstadoOdooCodigos(pinItems, (i) => i.codigos, contexto),
       ...conDetalle(pinItems),
     },
     nombres_problematicos: {
       descripcion: "Clientes con nombre_cliente nulo, o con espacios/saltos de línea al inicio o final (antes de cualquier normalización).",
+      por_estado_odoo: porEstadoOdoo(nombresProbRes.rows, (r) => r.ruc, activoOdooPorRuc),
       ...paginar(
-        nombresProbRes.rows.map((r) => ({ codigo_cliente: r.codigo_cliente, nombre_cliente_crudo: r.nombre_cliente, company_id: r.company_id })),
+        nombresProbRes.rows.map((r) => ({
+          codigo_cliente: r.codigo_cliente,
+          nombre_cliente_crudo: r.nombre_cliente,
+          company_id: r.company_id,
+          activo_odoo: clasificarActivoOdoo(r.ruc, activoOdooPorRuc),
+        })),
         offset,
         limite
       ),
@@ -705,7 +781,7 @@ async function auditarDuplicados(companyId, offset, limite, formatoSalida, inclu
 // ============================================================
 function sqlSinCanal() {
   return `
-    SELECT codigo_cliente, nombre_cliente, nombre_comercial_cliente, codigo_subcanal, company_id
+    SELECT codigo_cliente, nombre_cliente, nombre_comercial_cliente, codigo_subcanal, company_id, TRIM(identificacion_cliente) AS ruc
     FROM clientes
     WHERE codigo_tipo_negocio IS NULL
       AND ($1::text IS NULL OR company_id = $1)
@@ -713,16 +789,19 @@ function sqlSinCanal() {
   `;
 }
 
-async function auditarSinCanal(companyId, offset, limite, formatoSalida) {
+async function auditarSinCanal(companyId, offset, limite, formatoSalida, activoOdooPorRuc) {
   const { rows } = await pool.query(sqlSinCanal(), [companyId || null]);
-  if (formatoSalida === "resumen_por_tipo") return { total: rows.length };
+  if (formatoSalida === "resumen_por_tipo") {
+    return { total: rows.length, por_estado_odoo: porEstadoOdoo(rows, (r) => r.ruc, activoOdooPorRuc) };
+  }
   const items = rows.map((r) => ({
     codigo_cliente: r.codigo_cliente,
     nombre_cliente: nombreCliente(r),
     company_id: r.company_id,
+    activo_odoo: clasificarActivoOdoo(r.ruc, activoOdooPorRuc),
     sin_subcanal_tambien: r.codigo_subcanal === null,
   }));
-  return paginar(items, offset, limite);
+  return { ...paginar(items, offset, limite), por_estado_odoo: porEstadoOdoo(rows, (r) => r.ruc, activoOdooPorRuc) };
 }
 
 // ============================================================
@@ -766,11 +845,10 @@ async function fetchOdooActivoPorRuc() {
   return map;
 }
 
-async function auditarActivosSinConsumo(companyId, umbralDias, offset, limite, formatoSalida) {
-  const [ultimaRes, clientesRes, activoOdooPorRuc] = await Promise.all([
+async function auditarActivosSinConsumo(companyId, umbralDias, offset, limite, formatoSalida, activoOdooPorRuc) {
+  const [ultimaRes, clientesRes] = await Promise.all([
     pool.query(SQL_ULTIMA_COMPRA_GLOBAL),
     pool.query(sqlClientesConRuc(), [companyId || null]),
-    fetchOdooActivoPorRuc(),
   ]);
 
   const mapUltima = new Map(ultimaRes.rows.map((r) => [r.customer_code, r.ultima]));
@@ -828,13 +906,18 @@ async function auditoriaClientes({
     return { companias: await listarCompanias() };
   }
 
+  // `activoOdooPorRuc` se trae UNA sola vez por llamada (ver comentario
+  // grande sobre el reporte de Kenny Navas, 2026-10-01) y se reutiliza en
+  // las 5 categorías — antes solo `activos_sin_consumo` la pedía.
+  const activoOdooPorRuc = await fetchOdooActivoPorRuc();
+
   if (categoria) {
     let resultado;
-    if (categoria === "direcciones_incompletas") resultado = await auditarDireccionesIncompletas(company_id, offset, limite, formato_salida);
-    else if (categoria === "coordenadas") resultado = await auditarCoordenadas(company_id, tipo_problema, offset, limite, formato_salida, solo_activos_dias);
-    else if (categoria === "duplicados") resultado = await auditarDuplicados(company_id, offset, limite, formato_salida, incluir_cadenas);
-    else if (categoria === "sin_canal") resultado = await auditarSinCanal(company_id, offset, limite, formato_salida);
-    else if (categoria === "activos_sin_consumo") resultado = await auditarActivosSinConsumo(company_id, umbral_dias_inactividad, offset, limite, formato_salida);
+    if (categoria === "direcciones_incompletas") resultado = await auditarDireccionesIncompletas(company_id, offset, limite, formato_salida, activoOdooPorRuc);
+    else if (categoria === "coordenadas") resultado = await auditarCoordenadas(company_id, tipo_problema, offset, limite, formato_salida, solo_activos_dias, activoOdooPorRuc);
+    else if (categoria === "duplicados") resultado = await auditarDuplicados(company_id, offset, limite, formato_salida, incluir_cadenas, activoOdooPorRuc);
+    else if (categoria === "sin_canal") resultado = await auditarSinCanal(company_id, offset, limite, formato_salida, activoOdooPorRuc);
+    else if (categoria === "activos_sin_consumo") resultado = await auditarActivosSinConsumo(company_id, umbral_dias_inactividad, offset, limite, formato_salida, activoOdooPorRuc);
     return { categoria, company_id: company_id || null, ...resultado };
   }
 
@@ -842,11 +925,11 @@ async function auditoriaClientes({
   // (MUESTRA_RESUMEN, no `limite` — para pedir el detalle completo de una
   // categoría, se debe pasar `categoria` explícito).
   const [direcciones, coordenadas, duplicados, sinCanal, activosSinConsumo] = await Promise.all([
-    auditarDireccionesIncompletas(company_id, 0, MUESTRA_RESUMEN, "json"),
-    auditarCoordenadas(company_id, tipo_problema, 0, MUESTRA_RESUMEN, "json", solo_activos_dias),
-    auditarDuplicados(company_id, 0, MUESTRA_RESUMEN, "json", incluir_cadenas),
-    auditarSinCanal(company_id, 0, MUESTRA_RESUMEN, "json"),
-    auditarActivosSinConsumo(company_id, umbral_dias_inactividad, 0, MUESTRA_RESUMEN, "json"),
+    auditarDireccionesIncompletas(company_id, 0, MUESTRA_RESUMEN, "json", activoOdooPorRuc),
+    auditarCoordenadas(company_id, tipo_problema, 0, MUESTRA_RESUMEN, "json", solo_activos_dias, activoOdooPorRuc),
+    auditarDuplicados(company_id, 0, MUESTRA_RESUMEN, "json", incluir_cadenas, activoOdooPorRuc),
+    auditarSinCanal(company_id, 0, MUESTRA_RESUMEN, "json", activoOdooPorRuc),
+    auditarActivosSinConsumo(company_id, umbral_dias_inactividad, 0, MUESTRA_RESUMEN, "json", activoOdooPorRuc),
   ]);
 
   return {

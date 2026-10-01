@@ -5317,3 +5317,122 @@ original) — ni `clientes` ni `direcciones_clientes` tienen esa columna;
 se expone `ciudad_cliente` tal cual existe, sin inventar un campo que no
 está en los datos. `dashboard_backend`/`mcp_server` **no se
 redesplegaron** — pendiente de que el usuario revise el diff y autorice.
+
+## 🐛 Dos reportes de Kenny Navas (bodega, vía Slack, 2026-10-01)
+
+### Bug 1 — `ventasCliente` sobrecuenta unidades/dólares — DIAGNOSTICADO, fix PROPUESTO, no implementado todavía
+
+**El reporte**: cliente MUÑOZ TABAREZ PAUL LENIN, producto BOTELLÓN 20L
+AQUA PREMIUM (LIQUÍDO), septiembre 2026. El MCP devolvió $5,990.68 / 3,990
+unidades (29 documentos). Kenny contó a mano: 3,235 unidades brutas, menos
+125 de un documento en $0 (regalía) = 3,110 netas.
+
+**Hipótesis descartada (pedido explícito de revisar primero)**: ¿cliente
+duplicado por RUC, sumando 2 registros como si fueran uno? NO — confirmado
+con datos reales: RUC `0917064057` tiene exactamente 1 fila en `clientes`
+(`codigo_cliente=228561`), sin duplicado señal fuerte ni débil. Esta
+hipótesis queda descartada con evidencia, no solo revisada.
+
+**Causa real, encontrada y reconciliada al centavo**: `facturas` tiene
+**37 documentos** (de ~527K totales — 0.007%, pero `concentrados y
+empeorando`: 27 de los 37 son del último mes, 2026-08-31 en adelante) con
+código `FAM#-NNNNNN` (ej. `FAM6-000135`) que son el **mismo documento real**
+que otro con código `FA0XX-XXX-NNNNNN` (ej. `FA001-106-000000142`) —
+mismo `customer_code`, misma `fecha_creacion`, mismo `total`/`cantidad`
+EXACTOS. `SQL_HISTORIAL` de `ventasCliente.js` (y de cualquier otra tool
+que sume `facturas` sin deduplicar) cuenta AMBOS como si fueran 2 ventas
+distintas.
+
+Reconciliación exacta para este caso (codigo_producto=28, "BOTELLÓN 20L
+AQUA PREMIUM (LIQUÍDO)", septiembre 2026, codigo_cliente=228561):
+
+| Fuente | Unidades | Dólares |
+|---|---|---|
+| `ordenes` (19 docs, incluye el $0 de regalía de 125u) | 2,480 | $3,650.20 |
+| `facturas` código `FA001-106-...` (5 docs, el real) | 755 | $1,170.24 |
+| `facturas` código `FAM6-...` (5 docs, **duplicado del anterior**) | 755 | $1,170.24 |
+| **Suma correcta** (ordenes + facturas contado 1 vez) = **bruto real de Kenny** | **3,235** | — |
+| Menos regalía $0 (125u) = **neto de Kenny** | **3,110** | — |
+| **Suma con el bug** (ordenes + AMBOS códigos de factura) = **lo que devolvió el MCP** | **3,990** | **$5,990.68** |
+
+Los 3 números (3235 bruto, 3110 neto, 3990 reportado, $5,990.68) coinciden
+EXACTOS con lo que dijo Kenny — la causa está encontrada, no es una
+hipótesis.
+
+**Por qué NO se puede excluir `FAM%` a ciegas**: de los 37 documentos
+`FAM#` totales, solo ~26 tienen un "gemelo" real (mismo customer+fecha+
+total bajo otro código). Los ~11 restantes (todos de antes de agosto 2026,
+esporádicos) NO tienen gemelo — son la ÚNICA representación de esa venta.
+Excluir por prefijo de código borraría ventas reales. El fix correcto
+tiene que ser consciente del gemelo (self-join por customer_code+fecha+
+total, igual que se usó para detectarlos en esta investigación), no un
+filtro estático.
+
+**Propuesta de fix (NO implementada, pendiente de confirmación)**: en
+`SQL_HISTORIAL` (y cualquier otra query de `facturas` que se vea
+afectada), deduplicar documentos `facturas` donde existan 2+ códigos con
+mismo `customer_code`+`fecha_creacion`+`total` (y, idealmente,
+`origen_sistema`/`tipo_movimiento` para no fundir coincidencias legítimas)
+quedándose con uno solo — el candidato natural es preferir el código con
+`tipo_movimiento` poblado (el "real"/oficial) sobre el que lo tiene vacío.
+Queda por decidir: ¿implementar esto en cada tool que toca `facturas`
+(riesgo de repetir la lógica 6+ veces), o en una vista/CTE compartida? Y
+sobre todo: esto es un síntoma de un problema de SYNC (¿por qué
+`sincronizacionService.js` o el flujo de Odoo está creando 2 documentos
+para la misma venta?) — la causa raíz real puede estar en backend, no en
+mcp-server; este análisis no llegó a investigar el código de sync en sí,
+solo confirmó el síntoma en los datos.
+
+### Bug 2 — `auditoriaClientes` mezclaba archivados sin distinguirlos — RESUELTO
+
+**El reporte**: los clientes de la categoría "coordenadas mal puestas" en
+varios casos ya están archivados en Odoo (`res.partner.active=false`).
+Pedido: confirmar qué categorías filtran por eso, y si no filtran,
+**separar el conteo** (no excluir) — mismo criterio que
+`activos_sin_consumo`. Importante porque esa lista alimenta
+`auditoriaParadasFlota`.
+
+**Confirmado antes de corregir**: de las 5 categorías, solo
+`activos_sin_consumo` tocaba `res.partner.active` (es su criterio
+central). Las otras 4 (`direcciones_incompletas`, `coordenadas`,
+`duplicados` — las 7 señales —, `sin_canal`) nunca llamaban a Odoo.
+Confirmado con `grep` de `fetchOdooActivoPorRuc`/`res.partner` antes del
+fix.
+
+**Implementado**: cada una de esas 4 categorías ahora trae `activo_odoo`
+(`'ACTIVO'`/`'ARCHIVADO'`/`'SIN_MATCH_ODOO'`/`'SIN_RUC'`) por item, y
+`por_estado_odoo` (desglose) a nivel de categoría/señal — en
+`formato_salida='resumen_por_tipo'` y en el JSON completo, siempre
+consistentes entre sí. `activos_sin_consumo` queda SIN este campo a
+propósito (ya usa `res.partner.active` como FILTRO, no como dimensión —
+agregarle el split sería 100% ACTIVO por construcción, redundante). El
+mapa `activoOdooPorRuc` (`fetchOdooActivoPorRuc()`, función reutilizada
+tal cual, no reescrita) ahora se trae UNA sola vez por llamada a
+`auditoriaClientes()` desde el orquestador — antes, en un `resumen` sin
+categoría, se hubiera llamado 2 veces (acá + adentro de
+`activos_sin_consumo`).
+
+**Validado con datos reales — confirma el reporte de Kenny con números**:
+
+| Categoría | ACTIVO | ARCHIVADO | SIN_MATCH_ODOO | SIN_RUC |
+|---|---|---|---|---|
+| coordenadas | 2,533 | **155** | 30 | 6 |
+| direcciones_incompletas | 371 | **133** | 6 | 0 |
+| sin_canal | 6,445 | **2,795** | 438 | 139 |
+
+155 de 2,724 candidatos de "coordenadas mal puestas" (5.7%) ya están
+archivados — exactamente el tipo de contaminación que Kenny reportó, y
+que habría pasado directo a `auditoriaParadasFlota` sin este fix.
+Verificado en vivo (no solo confiado en la tool): tomado el primer item
+`ARCHIVADO` del JSON completo, confirmado por una llamada INDEPENDIENTE a
+`res.partner.search_read` que su RUC real tiene `active=false`.
+
+### Validación técnica (ambos bugs)
+
+Suite completa (`node:20-alpine`): `seguridad-smoke-test` OK,
+`oauth-smoke-test` OK (17 tools, sin cambios), `auditoriaClientes-real`
+OK (sin regresión), `auditoriaClientesAmpliacion-real` OK (sin
+regresión). Nuevo `auditoriaClientesEstadoOdoo-real.test.js` (24
+aserciones, incluye la verificación en vivo contra Odoo) en verde. Bug 1
+NO tiene cambio de código (diagnóstico + propuesta, pendiente de
+confirmación antes de tocar `ventasCliente.js`).
