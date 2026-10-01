@@ -5765,3 +5765,144 @@ estar en el rango de $4,600-$9,000+ de más, dependiendo del
 comportamiento de los próximos 3 días. Queda a criterio del usuario si
 eso amerita un aviso a CIRE antes de que se cierre y envíe esa semana,
 independientemente de cuándo se resuelva la llave técnica de fondo.
+
+## 📐 Propuesta de diseño COMPLETA — reconciliación de `facturas` (2026-10-01, SOLO PROPUESTA, sin implementar — para revisión de Alberto)
+
+Continuación de la propuesta de arriba: se resolvió la pregunta
+bloqueante #1 probando en vivo contra la API real de MobilVendor y
+contra Odoo (lecturas puras, sin escribir nada) — esto cambia la
+recomendación de la llave de reconciliación. Con eso resuelto, se
+completa el diseño de los 3 puntos pendientes.
+
+### Pregunta bloqueante #1 — RESUELTA con evidencia en vivo
+
+**Sí existe un id interno estable en la API de MobilVendor, no
+capturado hoy.** Se logueó contra `https://s31.mobilvendor.com/web-service`
+con las credenciales reales (`MV_USUARIO`/`MV_CLAVE`/`MV_CONTEXTO`, ya en
+`.env` del backend) y se pidió `getInvoices` para un documento real —
+la respuesta cruda trae un campo **`id`** (ej. `"id": "840127"`),
+numérico, de la propia base de datos de MobilVendor, **completamente
+separado de `code`** — nunca se captura hoy (confirmado: ningún
+`doc.id` se lee en `sincronizacionService.js`). También se confirmó que
+la respuesta cruda trae `access_code`/`auth_code` (la clave de acceso
+SRI de 49 dígitos) ya poblados del lado MobilVendor — tampoco se
+capturan hoy hacia `facturas.auth_code` (por eso esa columna está en
+0/63,531 para MobilVendor, como se documentó en la sección de causa
+raíz — no es que MobilVendor no tenga el dato, es que nuestro sync
+nunca lo lee).
+
+**Pero la mitad del problema NO se resuelve con esto.** Se buscó
+también un puente YA EXISTENTE del lado Odoo — y lo hay, pero está
+roto: `account.move` tiene un campo custom llamado **`mobilvendor_id`**
+(alguien, en algún momento, pensó exactamente en este problema). Se
+leyó en vivo contra Odoo (XML-RPC, mismas credenciales del backend) para
+los 15 pares gemelos de la sección anterior más una muestra amplia de
+300 facturas recientes sin relación con el bug — **resultado: en el
+100% de los casos (0 excepciones de 300), `mobilvendor_id` es idéntico
+a `name` (o está vacío) — nunca contiene el código nativo real de
+MobilVendor.** Es un campo muerto/espejo, no un puente funcional. No se
+investigó POR QUÉ está roto (quién lo llena, qué automatización de Odoo
+lo escribe) — eso es trabajo de quien mantenga esa integración del lado
+Odoo (posiblemente tema para Alberto o el implementador de Odoo), no
+algo que se pueda arreglar desde este repo.
+
+**Conclusión**: el id interno de MobilVendor resuelve el 38% de los
+pares que son MobilVendor-contra-sí-mismo (mismo documento real,
+reportado con 2 `code` distintos en 2 sync distintos) de forma
+determinística y permanente. El 62% restante (MobilVendor-contra-Odoo)
+**sigue sin un puente técnico confiable** — no hay ningún campo, ni en
+MobilVendor ni en Odoo, que hoy conecte de forma determinística un
+documento de un sistema con su par en el otro. Para ese 62% la única
+opción disponible es la llave compuesta + exclusión de cadenas ya
+propuesta arriba, como mitigación, no como solución definitiva — la
+solución definitiva de ese 62% depende de un cambio FUERA de este
+repo (que el `mobilvendor_id` de Odoo se llene de verdad, o que la
+integración Odoo↔MobilVendor exponga algo equivalente).
+
+### Llave de reconciliación definitiva (two-tier, dado lo de arriba)
+
+**Tier 1 — determinístico, sin heurística, implementable ya:**
+capturar el `id` crudo de MobilVendor en una columna nueva
+`facturas.mobilvendor_internal_id` (poblada SOLO por el upsert de
+`sincronizacionService.js`, nunca por Odoo). En `syncDocumento`, antes
+del `Factura.upsert` actual (keyed por `code`), agregar un `SELECT code
+FROM facturas WHERE mobilvendor_internal_id = :id AND code <> :code
+LIMIT 1`: si existe, es el MISMO documento real que ya vimos con un
+`code` anterior — se hace `UPDATE` de esa fila (incluyendo el nuevo
+`code`) en vez de insertar una fila nueva. Esto previene
+**permanentemente** el 38% de duplicados MobilVendor-contra-sí-mismo,
+desde el momento en que se despliega, sin depender de nada externo.
+
+**Tier 2 — heurístico, con supervisión, para el 62% restante:**
+sin un puente real a Odoo, se mantiene la detección por
+`customer_code + fecha_creacion (día) + total exacto`, EXCLUYENDO
+clientes de cadena (mismo criterio `incluir_cadenas` de
+`auditoriaClientes.js`). Para clientes de cadena, el par se reporta en
+una tabla de revisión manual, nunca se marca solo. Esto corre como un
+**job programado** (no en el sync en tiempo real, porque depende de que
+AMBOS lados —MobilVendor y Odoo— ya hayan escrito su versión del
+documento, lo cual puede tardar horas/días) — propuesta: correrlo una
+vez al día, después del cron de las 00:00, sobre la ventana de los
+últimos `DIAS_RETRO` días (igual que el sync), marcando `duplicado_de`
+en los pares nuevos que encuentre.
+
+### Mecanismo `duplicado_de` para los 753 pares existentes (sin cambios respecto a la propuesta anterior, repetido aquí para que el documento quede completo)
+
+Columna nueva `facturas.duplicado_de varchar(30)` nullable — NO se
+borra nada. Backfill de los 753 pares históricos en modo dry-run
+primero (CSV de revisión), excluyendo cadenas, luego `UPDATE
+duplicado_de` real. `promo_lineas_venta` se reapunta al código "lleno"
+para los 153 casos que lo tienen. Nada que ya referencie cualquiera de
+los 2 códigos se rompe (ver detalle completo en la sección anterior).
+
+### Plan concreto para aplicar el fix a las 8 tools
+
+**Un solo punto de cambio, no 8.** Se agrega a `mcp-server/src/sql/
+clasificacion.js` (la misma fuente única que ya define
+`CASE_GRUPO_FACTURAS`/`FILTRO_CLIENTE_VALIDO`) una constante nueva:
+
+```js
+const FILTRO_FACTURAS_NO_DUPLICADO = "f.duplicado_de IS NULL";
+```
+
+Cada una de las 8 tools (`ventasPorGrupo.js`, `ventasPorCondicionPago.js`,
+`ventasPorRutaCondicion.js`, `resumenDiario.js`, `topProductos.js`,
+`ventasPorRuta.js`, `clientesPorGrupo.js`, `ventasRutaOk.js`) agrega
+**una sola línea** a su(s) `WHERE` existente sobre `facturas` (alias
+`f`): `AND ${FILTRO_FACTURAS_NO_DUPLICADO}` — igual de mecánico que el
+`FILTRO_CLIENTE_VALIDO` que ya usan todas. Cero cambios de lógica de
+negocio en cada tool individual — todas siguen agregando exactamente
+igual, solo dejan de sumar las filas marcadas.
+
+**Orden de implementación propuesto** (cada paso es reversible y no
+depende de que el siguiente esté listo):
+1. Migración aditiva: columna `duplicado_de` (nullable, sin default) +
+   columna `mobilvendor_internal_id` en `facturas`. Sin comportamiento
+   nuevo hasta que se pueblen — cero riesgo para producción.
+2. Backfill dry-run de los 753 pares conocidos (CSV, excluyendo
+   cadenas) → revisión manual → `UPDATE duplicado_de` real +
+   reapuntar `promo_lineas_venta` (153 casos).
+3. Fix en `sincronizacionService.js` (Tier 1): capturar
+   `mobilvendor_internal_id`, lógica de "buscar por internal_id antes
+   de upsert por code". Esto detiene el sangrado del 38% desde el día
+   que se despliega.
+4. Agregar `FILTRO_FACTURAS_NO_DUPLICADO` a `clasificacion.js` + 1
+   línea en cada una de las 8 tools. Correr la suite completa de cada
+   tool afectada antes de desplegar (ya existen tests `-real.test.js`
+   para la mayoría).
+5. Job programado (Tier 2) para los pares nuevos no-cadena que sigan
+   apareciendo por el lado MobilVendor-vs-Odoo, corriendo después del
+   cron diario.
+6. Plan de rollback: cada paso es aditivo/no-destructivo — revertir es
+   dejar de filtrar por `duplicado_de` (1 línea por tool) y/o dejar la
+   columna sin poblar; nunca hay que deshacer un delete porque nunca se
+   borra nada.
+
+### Estado
+
+**Nada de lo anterior está implementado — sigue pendiente de revisión
+de Alberto.** Con la pregunta bloqueante ya resuelta (incluyendo el
+hallazgo del campo `mobilvendor_id` roto en Odoo, que probablemente
+amerite su propio aviso aparte a quien mantenga esa integración), el
+diseño queda completo en sus 3 partes (llave, pares existentes, 8
+tools) a la espera de autorización para implementar.
