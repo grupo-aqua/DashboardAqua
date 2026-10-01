@@ -131,8 +131,44 @@ const SQL_BUSCAR_PRODUCTO = `
 
 // $1 = lista de codigo_cliente (uno o varios), $2 = inicio (timestamp),
 // $3 = fin exclusivo (timestamp), $4 = categoria (o NULL), $5 = codigo_producto (o NULL)
+//
+// `facturas_dedup` — ver TODO.md (bug reportado por Kenny Navas,
+// 2026-10-01, caso MUÑOZ TABAREZ): confirmado con datos reales que
+// `facturas` tiene documentos DUPLICADOS para la misma venta real — mismo
+// `customer_code`+mismo día+mismo `total` EXACTO, un código con
+// `tipo_movimiento` poblado (ej. 'FA001-106-000000142') y un "gemelo" con
+// `tipo_movimiento` vacío (ej. 'FAM6-000135'), ambos sumándose como si
+// fueran 2 ventas. NO se puede excluir por prefijo de código a ciegas:
+// confirmado que ~11 de 37 documentos con ese patrón NO tienen gemelo —
+// son la ÚNICA representación real de esa venta, excluirlos borraría
+// ingresos reales. Por eso el descarte es CONSCIENTE DEL GEMELO: una fila
+// con `tipo_movimiento` vacío se descarta SOLO cuando existe otra fila del
+// mismo cliente/día/monto con `tipo_movimiento` poblado — nunca a ciegas.
+// Causa de fondo (por qué el sync crea el segundo documento) queda
+// pendiente de investigar aparte, ver TODO.md — este fix ataca el
+// síntoma con evidencia real, no la causa de sync.
 const SQL_HISTORIAL = `
-  WITH base AS (
+  WITH facturas_dedup AS (
+    SELECT f.*
+    FROM facturas f
+    WHERE f.status = 2
+      AND f.customer_code = ANY($1::text[])
+      AND f.fecha_creacion >= $2
+      AND f.fecha_creacion <  $3
+      AND NOT (
+        (f.tipo_movimiento IS NULL OR f.tipo_movimiento = '')
+        AND EXISTS (
+          SELECT 1 FROM facturas g
+          WHERE g.customer_code = f.customer_code
+            AND g.fecha_creacion::date = f.fecha_creacion::date
+            AND g.total = f.total
+            AND g.status = 2
+            AND g.tipo_movimiento IS NOT NULL AND g.tipo_movimiento <> ''
+            AND g.code <> f.code
+        )
+      )
+  ),
+  base AS (
     SELECT
       o.fecha_creacion AS fecha,
       o.customer_code AS codigo_cliente_fila,
@@ -163,13 +199,9 @@ const SQL_HISTORIAL = `
       CASE WHEN f.tipo_movimiento = 'out_refund' THEN -dd.cantidad ELSE dd.cantidad END AS unidades,
       CASE WHEN f.tipo_movimiento = 'out_refund' THEN -dd.total    ELSE dd.total    END AS dolares,
       f.code AS doc_code
-    FROM facturas f
+    FROM facturas_dedup f
     JOIN detalle_documento dd ON dd.documento_code = f.code
-    WHERE f.status = 2
-      AND f.customer_code = ANY($1::text[])
-      AND f.fecha_creacion >= $2
-      AND f.fecha_creacion <  $3
-      AND ($4::text IS NULL OR dd.descripcion_categoria = $4)
+    WHERE ($4::text IS NULL OR dd.descripcion_categoria = $4)
       AND ($5::text IS NULL OR dd.codigo_producto = $5)
   )
   SELECT
