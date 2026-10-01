@@ -185,6 +185,22 @@ const Factura = sequelize.define("Factura", {
     allowNull: true,
   },
 
+  // Reconciliación MobilVendor↔Odoo (2026-10-01, ver TODO.md) — marcado NO
+  // destructivo: si está poblado, esta fila es un duplicado detectado y su
+  // valor es el `code` de la fila "buena" que debe contar en los reportes.
+  duplicado_de: {
+    type: DataTypes.STRING(30),
+    allowNull: true,
+  },
+
+  // `id` crudo de la API de MobilVendor (NO el `code` fiscal, que cambia de
+  // valor para el mismo documento real a lo largo de su ciclo de vida) —
+  // lo captura solo el sync de MobilVendor, Odoo nunca lo conoce.
+  mobilvendor_internal_id: {
+    type: DataTypes.STRING(30),
+    allowNull: true,
+  },
+
 }, {
   tableName: "facturas",
   timestamps: false,

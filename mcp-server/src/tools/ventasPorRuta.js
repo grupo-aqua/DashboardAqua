@@ -2,7 +2,7 @@
 const { z } = require("zod");
 const { pool } = require("../db");
 const { finExclusivo, diffDias } = require("../util/fechas");
-const { FILTRO_PREVENTA_SELLER } = require("../sql/clasificacion");
+const { FILTRO_PREVENTA_SELLER, FILTRO_FACTURAS_NO_DUPLICADO } = require("../sql/clasificacion");
 
 // Espacio incluido a propósito: hay códigos de ruta reales con espacio
 // ("TELEVENTA 1", "PREVENTA VIP 1", "RUTA 113", "POS RUTA 131" — estas
@@ -63,6 +63,7 @@ const SQL = `
     FROM facturas f
     JOIN detalle_documento dd ON dd.documento_code = f.code
     WHERE f.status = 2
+      AND ${FILTRO_FACTURAS_NO_DUPLICADO("f")}
       AND f.seller_code = ANY($1::text[])
       AND f.fecha_creacion >= $2
       AND f.fecha_creacion <  $3

@@ -1560,10 +1560,83 @@ CREATE TABLE IF NOT EXISTS auditoria_chat (
 -- no se aprovisionó (ej. un dev local sin el servidor MCP), este archivo
 -- sigue corriendo limpio en vez de fallar por un rol que no le interesa a
 -- ese entorno.
+-- =========================================================================
+-- Reconciliación de `facturas` MobilVendor↔Odoo (2026-10-01, ver TODO.md:
+-- "Propuesta de diseño COMPLETA — reconciliación de facturas"). `facturas`
+-- quedaba con 2 filas para la misma venta real: el sync de MobilVendor y el
+-- de Odoo escriben cada uno con su propio criterio de `code` (PK), sin
+-- coordinarse — ver TODO.md, sección de causa raíz, para el análisis
+-- completo con datos reales.
+--
+-- `duplicado_de`: marcado NO DESTRUCTIVO (nunca se borra una fila). Cuando
+-- una fila es el duplicado detectado de otra, apunta al `code` de la fila
+-- "buena" (la que debe contar en los reportes). Las 8 tools que suman
+-- `facturas` agregan `AND f.duplicado_de IS NULL` (ver
+-- `FILTRO_FACTURAS_NO_DUPLICADO` en mcp-server/src/sql/clasificacion.js) —
+-- un solo lugar deja de contar la fila marcada, en vez de borrarla (que
+-- rompería `promo_lineas_venta`, huérfana de FK, para las filas de
+-- MobilVendor con promos — ver TODO.md).
+--
+-- `mobilvendor_internal_id`: el `id` interno de MobilVendor (campo crudo de
+-- su API, confirmado en vivo — ver TODO.md — DISTINTO de `code`, que
+-- cambia de valor para el mismo documento real a lo largo de su ciclo de
+-- vida). Lo captura SOLO el sync de MobilVendor
+-- (`backend/services/sincronizacionService.js`, función `syncDocumento`) —
+-- Odoo nunca lo conoce. Permite detectar, de forma determinística (sin
+-- heurística de fecha/monto), cuando MobilVendor reporta el MISMO
+-- documento real dos veces con 2 `code` distintos en 2 sincronizaciones
+-- separadas (el "Tier 1" del diseño — resuelve ~38% de los pares conocidos
+-- sin depender de Odoo).
+-- =========================================================================
+ALTER TABLE facturas ADD COLUMN IF NOT EXISTS duplicado_de            VARCHAR(30);
+ALTER TABLE facturas ADD COLUMN IF NOT EXISTS mobilvendor_internal_id VARCHAR(30);
+
+-- FK autorreferencial defensiva: `duplicado_de` siempre debe apuntar a un
+-- `code` real de la misma tabla. ON DELETE SET NULL es solo defensivo (en
+-- la práctica nunca se borra una fila de `facturas`).
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'fk_facturas_duplicado_de'
+  ) THEN
+    ALTER TABLE facturas
+      ADD CONSTRAINT fk_facturas_duplicado_de
+      FOREIGN KEY (duplicado_de)
+      REFERENCES facturas(code)
+      ON UPDATE CASCADE
+      ON DELETE SET NULL;
+  END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_facturas_duplicado_de
+  ON facturas(duplicado_de)
+  WHERE duplicado_de IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_facturas_mobilvendor_internal_id
+  ON facturas(mobilvendor_internal_id)
+  WHERE mobilvendor_internal_id IS NOT NULL;
+
+-- Tabla de revisión manual (Tier 2 / backfill): pares candidatos detectados
+-- por la llave heurística (cliente+día+monto) que NO cumplen la condición
+-- de 1-a-1 (ver TODO.md) — ej. cuentas de cadena/consolidadas (TIA, El
+-- Rosado) donde varios documentos reales distintos coinciden en
+-- cliente+día+monto por azar. Nunca se marcan `duplicado_de`
+-- automáticamente — quedan acá para que alguien los revise a mano.
+CREATE TABLE IF NOT EXISTS facturas_duplicados_revision_manual (
+  id                SERIAL PRIMARY KEY,
+  code_candidato_a  VARCHAR(30) NOT NULL,
+  code_candidato_b  VARCHAR(30) NOT NULL,
+  motivo            VARCHAR(100) NOT NULL, -- ej. 'AMBIGUO_MULTIPLES_CANDIDATOS'
+  detectado_en      TIMESTAMP DEFAULT NOW(),
+  revisado          BOOLEAN DEFAULT FALSE,
+  UNIQUE (code_candidato_a, code_candidato_b)
+);
+
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mcp_readonly') THEN
     GRANT SELECT ON clientes, detalle_documento, direcciones_clientes, facturas, ordenes, productos TO mcp_readonly;
     GRANT SELECT (codigo_cliente, fecha_visita, accion) ON historial_visitas TO mcp_readonly;
+    GRANT SELECT ON facturas_duplicados_revision_manual TO mcp_readonly;
   END IF;
 END $$;

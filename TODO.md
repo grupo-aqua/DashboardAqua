@@ -5900,9 +5900,149 @@ depende de que el siguiente esté listo):
 
 ### Estado
 
-**Nada de lo anterior está implementado — sigue pendiente de revisión
-de Alberto.** Con la pregunta bloqueante ya resuelta (incluyendo el
-hallazgo del campo `mobilvendor_id` roto en Odoo, que probablemente
-amerite su propio aviso aparte a quien mantenga esa integración), el
-diseño queda completo en sus 3 partes (llave, pares existentes, 8
-tools) a la espera de autorización para implementar.
+~~Nada de lo anterior está implementado~~ → **Implementado completo**
+(2026-10-01, autorizado explícitamente por el usuario tras revisar esta
+propuesta — "autorizado para implementar completo", las 2 capas +
+`duplicado_de` + el filtro en las 8 tools). Ver la sección siguiente
+("✅ Implementación...") para el detalle de qué se construyó, cómo se
+validó, y los resultados reales del backfill. **Rama
+`fix/reconciliacion-facturas-mobilvendor-odoo`, PR nuevo — NO mergeado
+ni desplegado todavía**, eso se autoriza aparte cuando esté listo (igual
+que el resto de este flujo de trabajo).
+
+## ✅ Implementación completa — reconciliación de `facturas` (2026-10-01)
+
+Siguiendo exactamente el orden de implementación propuesto arriba. Todo
+verificado en vivo contra `ventas_mv` (no solo `node --check`) antes de
+dar cada paso por terminado — se encontraron y corrigieron 2 bugs reales
+durante la validación (ver abajo), ninguno habría aparecido con solo
+revisión de código.
+
+### 1. Migración (`backend/sql/000_schema.sql`, `backend/models/factura.js`)
+
+`facturas.duplicado_de VARCHAR(30)` (FK autorreferencial a
+`facturas(code)`, `ON DELETE SET NULL`) + `facturas.mobilvendor_internal_id
+VARCHAR(30)`, ambas nullable, con sus índices parciales. Tabla nueva
+`facturas_duplicados_revision_manual` para los casos ambiguos (ver
+punto 3). Corrida en vivo contra `ventas_mv` — limpia, sin errores,
+100% idempotente (ya validado con `backend/sql/000_schema.sql` completo
+corriendo 2 veces).
+
+### 2. Tier 1 — `backend/services/sincronizacionService.js` (`syncDocumento`)
+
+Captura `doc.id` (el id interno de MobilVendor) en
+`mobilvendor_internal_id`. Antes de cada upsert de tipo factura, busca
+si ya existe una fila con el mismo `mobilvendor_internal_id` bajo OTRO
+`code` — si existe, la marca `duplicado_de` apuntando al `code` nuevo
+**DESPUÉS** del upsert (no antes).
+
+**🐛 Bug real encontrado validando en vivo**: la primera versión hacía
+el `UPDATE duplicado_de` ANTES del upsert de la fila nueva — la FK
+`fk_facturas_duplicado_de` lo rechazaba (`duplicado_de` no puede apuntar
+a un `code` que todavía no existe). Reproducido con un caso sintético
+real (insertar 2 filas de prueba con el mismo `mobilvendor_internal_id`,
+confirmar el error, corregir el orden, confirmar que ya no pasa) —
+corregido invirtiendo el orden (upsert primero, marcar después). Sin
+este caso de prueba en vivo el bug habría llegado a producción (pasaba
+`node --check` sin problema, es un error de lógica/orden, no de
+sintaxis).
+
+### 3. `duplicado_de` + backfill de los 753 pares existentes
+
+`ops/facturas-duplicados/backfill_duplicados.js` — detección por
+cliente+día+total (1 lado `tipo_movimiento` vacío, el otro poblado),
+con el gate de seguridad 1-a-1 bidireccional propuesto arriba (evita
+marcar automáticamente cuentas de cadena). Dry-run primero, después
+`--aplicar`.
+
+**🐛 Segundo bug real encontrado validando en vivo**: la primera corrida
+en dry-run reportó **0 casos seguros, 763 ambiguos** — contradecía por
+completo la medición de la sección de causa raíz (740/749 esperados como
+seguros). Causa: `pg` devuelve `COUNT(*)` (bigint) como **string**, y la
+comparación `=== 1` en JS nunca es cierta contra `"1"` — todo caía en
+"ambiguo" por el bug, no por ser realmente ambiguo. Corregido con
+`Number()` antes de comparar; re-validado contra una query SQL directa
+equivalente (mismo resultado exacto, 738/25) antes de confiar en el
+script. El mismo fix se aplicó en
+`backend/services/reconciliacionFacturasService.js` (Tier 2, construido
+después, se escribió ya con el fix incluido).
+
+**Resultado real del backfill** (corrido en producción, dentro de una
+transacción):
+```
+Candidatos totales          : 763
+Marcados duplicado_de       : 738   ($16,623.31)
+Líneas de promo reapuntadas : 165   (promo_lineas_venta.documento_code)
+A revisión manual           : 25    (facturas_duplicados_revision_manual)
+```
+(738 vs. los 740 estimados en la sección de causa raíz — la diferencia
+es esperable: son mediciones en momentos distintos, con el sync
+corriendo en paralelo entre medio.)
+
+### 4. Tier 2 — job diario (`backend/services/reconciliacionFacturasService.js` + `backend/cron/tareasCron.js`)
+
+Misma lógica de detección que el backfill (de hecho el backfill USA la
+misma query), scopeada a los últimos `DIAS_RETRO` días. Se agregó como
+paso 5 de `ejecutarSincronizacion()` en `tareasCron.js`, **corriendo en
+los 2 ciclos diarios (00:00 y 12:00)** — no solo el de medianoche como
+decía la propuesta original: es idempotente (`duplicado_de IS NULL` en
+el filtro) y correr 2 veces al día en vez de 1 reduce a la mitad el
+tiempo máximo que un duplicado nuevo queda sin marcar, sin costo
+adicional real. Validado en vivo tras el backfill: 0 nuevos "seguros"
+(correcto, ya no quedaba ninguno dentro de la ventana), 10 ambiguos
+detectados y agregados a la tabla de revisión (sin duplicar los que ya
+estaban — `ON CONFLICT DO NOTHING` confirmado funcionando).
+
+### 5. Filtro compartido en las 8 tools (`mcp-server/src/sql/clasificacion.js` + 8 archivos en `mcp-server/src/tools/`)
+
+`FILTRO_FACTURAS_NO_DUPLICADO(aliasFacturas)` agregado a
+`clasificacion.js` (mismo patrón que `FILTRO_CLIENTE_VALIDO`), una línea
+agregada al `WHERE` de cada bloque de `facturas` en `ventasPorGrupo.js`,
+`ventasPorCondicionPago.js` (2 bloques), `ventasPorRutaCondicion.js` (4
+bloques), `resumenDiario.js` (2 bloques), `topProductos.js` (2 bloques),
+`ventasPorRuta.js`, `clientesPorGrupo.js`, `ventasRutaOk.js` — 14
+bloques en total, todos verificados 1:1 contra el conteo de `FROM
+facturas f` en cada archivo (ninguno quedó sin el filtro).
+
+### Validación — suite completa
+
+`node --check` en los 16 archivos tocados, limpio. Suite real contra
+`ventas_mv`:
+- `test:seguridad`, `test:oauth` — OK (17 tools sin cambios de registro).
+- `test:condicion-pago-real`, `test:ventas-ruta-ok-real`,
+  `test:clasificacion-ruta-combinada-real`,
+  `test:fallback-odoo-condicion-real`,
+  `test:clasificacion-domicilio-equipo-real`,
+  `test:auditoria-clientes-real`, `test:preventa-real`,
+  `test:facturas-proveedores-real`,
+  `test:ventas-cliente-facturas-duplicadas-real` — OK, sin tocar (datos
+  de meses/rutas sin duplicados conocidos, o tools no afectadas).
+- `test:ventas-por-ruta-condicion-real` — **FALLÓ primero, actualizado**:
+  el caso real "EMPRESAS 2026-09-04, contado $8.24 en ruta E4" resultó
+  ser EXACTAMENTE los 2 documentos duplicados (`FAE4-000017/018`,
+  $6.18+$2.06) de esa misma venta — confirmado 1:1 contra sus gemelos
+  Odoo ya marcados. El caso de prueba original estaba construido sobre
+  datos ya inflados por el bug; se actualizó a los valores correctos
+  (12266.29 en vez de 12274.53, contado=0, la ruta "E4" ya no aparece)
+  con un comentario explicando el porqué — no es una regresión, es la
+  prueba confirmando que el fix funciona.
+- `test:notas-credito-real` — sigue fallando con el MISMO drift de datos
+  preexistente ya documentado varias veces en este archivo (CD
+  COMISARIATO, -$316,613.12), confirmado NO relacionado a este cambio.
+- `test:backlog-prevendedores-real` — falló en
+  `advertencia_status_desactualizado` (frescura de `ordenes.status`,
+  nada que ver con `facturas` ni con este fix — `backlogPrevendedores.js`
+  no se tocó). No investigado, fuera de alcance de este fix.
+
+### Pendiente
+
+- Los 25 pares en `facturas_duplicados_revision_manual` quedan para
+  revisión manual (probablemente cuentas de cadena/consolidadas, mismo
+  patrón que TIA/El Rosado documentado arriba) — no se marcan solos, a
+  propósito.
+- El 62% de pares cross-sistema (MobilVendor-vs-Odoo) que NO tengan la
+  relación 1-a-1 sigue dependiendo del fix externo del campo
+  `mobilvendor_id` de Odoo (fuera de este repo, lo gestiona el usuario
+  directamente).
+- PR abierto, **sin mergear ni desplegar** — pendiente de autorización
+  aparte.

@@ -21,14 +21,25 @@ function cerca(a, b, tol = 0.05) {
 }
 
 async function main() {
-  // 1) EMPRESAS 2026-09-04 — caso dado: total $12,274.53, contado real ≈
-  //    $8.24 (ruta E4), el resto crédito.
+  // 1) EMPRESAS 2026-09-04 — caso dado ORIGINAL: total $12,274.53, contado
+  //    real ≈ $8.24 (ruta E4), el resto crédito. ACTUALIZADO 2026-10-01 tras
+  //    el fix de reconciliación de facturas (ver TODO.md, "Propuesta de
+  //    diseño COMPLETA — reconciliación de facturas"): los $8.24 de "ruta
+  //    E4" resultaron ser EXACTAMENTE los 2 documentos duplicados
+  //    FAE4-000017/018 (MobilVendor, $6.18+$2.06) de esta misma venta —
+  //    confirmado 1:1 contra sus gemelos Odoo FA001-051-000000951/952, ya
+  //    marcados `duplicado_de`. El caso real dado originalmente estaba
+  //    construido sobre datos ya inflados por el bug; ahora que se excluyen,
+  //    el total baja exacto en $8.24 y la ruta "E4" desaparece de por_ruta
+  //    (todo EMPRESAS real de este día queda sin seller_code propio, ver
+  //    SIN_RUTA_ASIGNADA — consistente con que EMPRESAS/Odoo se clasifica
+  //    por equipo_ventas_nombre, no por seller_code, ver clasificacion.js).
   const empresas = await ventasPorRutaCondicion({ grupo: "EMPRESAS", fecha_inicio: "2026-09-04", fecha_fin: "2026-09-04" });
-  asegurar(cerca(empresas.dolares_totales, 12274.53), `EMPRESAS 2026-09-04: dolares_totales (${empresas.dolares_totales}) ≈ 12274.53`);
+  asegurar(cerca(empresas.dolares_totales, 12266.29), `EMPRESAS 2026-09-04: dolares_totales (${empresas.dolares_totales}) ≈ 12266.29 (12274.53 original - 8.24 de los 2 documentos duplicados ya marcados)`);
   const contadoEmpresas = empresas.por_ruta.reduce((a, r) => a + r.dolares_contado, 0);
-  asegurar(cerca(contadoEmpresas, 8.24), `EMPRESAS 2026-09-04: suma de dolares_contado (${contadoEmpresas.toFixed(2)}) ≈ 8.24`);
+  asegurar(cerca(contadoEmpresas, 0), `EMPRESAS 2026-09-04: suma de dolares_contado (${contadoEmpresas.toFixed(2)}) ≈ 0 (el único contado real de este día eran los 2 documentos duplicados, ya excluidos)`);
   const e4 = empresas.por_ruta.find((r) => r.ruta === "E4");
-  asegurar(!!e4 && cerca(e4.dolares_contado, 8.24), `EMPRESAS 2026-09-04: el contado real está en E4 (${e4?.dolares_contado})`);
+  asegurar(!e4, `EMPRESAS 2026-09-04: la ruta "E4" ya no aparece en por_ruta (su única fuente eran los 2 documentos duplicados)`);
 
   // 2) VIP 2026-09-04 — caso dado: total $9,812.93, contado real ≈ $458.66.
   //    (El desglose por ruta exacto del pedido original mencionaba
