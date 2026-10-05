@@ -5436,3 +5436,891 @@ regresión). Nuevo `auditoriaClientesEstadoOdoo-real.test.js` (24
 aserciones, incluye la verificación en vivo contra Odoo) en verde. Bug 1
 NO tiene cambio de código (diagnóstico + propuesta, pendiente de
 confirmación antes de tocar `ventasCliente.js`).
+
+## 🐛✅ Fix: `ventasCliente` sobrecontaba unidades/dólares por documentos duplicados en `facturas` (reportado por Kenny Navas, bodega, vía Slack, 2026-10-01)
+
+### El reporte y la causa (ver también el PR #11 de `auditoriaClientes`, donde se investigó esto por primera vez junto con otro bug — acá queda el detalle completo y el fix)
+
+Caso real: cliente MUÑOZ TABAREZ PAUL LENIN (`codigo_cliente=228561`),
+producto BOTELLÓN 20L AQUA PREMIUM (LIQUÍDO) (`codigo_producto=28`),
+septiembre 2026. El MCP devolvía $5,990.68 / 3,990 unidades — Kenny había
+contado a mano 3,235 unidades brutas (3,110 netas tras restar 125u de una
+regalía en $0, que nunca fue parte de este bug).
+
+**Hipótesis descartada con evidencia** (pedido explícito: revisar
+primero): ¿cliente duplicado por RUC? NO — el RUC `0917064057` tiene
+exactamente 1 fila en `clientes`.
+
+**Causa real, reconciliada al centavo**: `facturas` tiene documentos
+DUPLICADOS para la misma venta real — mismo `customer_code`+mismo
+día+mismo `total` EXACTO, un código con `tipo_movimiento` poblado (ej.
+`FA001-106-000000142`) y un "gemelo" con `tipo_movimiento` vacío (ej.
+`FAM6-000135`). `SQL_HISTORIAL` sumaba ambos como si fueran 2 ventas.
+
+### El fix — deduplicación CONSCIENTE DEL GEMELO, no por prefijo de código
+
+Investigado antes de tocar código: de los documentos con `tipo_movimiento`
+vacío, NO todos tienen un gemelo duplicado — algunos son la ÚNICA
+representación real de esa venta (confirmado con el caso original: ~11 de
+37 documentos `FAM#` no tenían gemelo). Excluir por prefijo de código a
+ciegas hubiera borrado ingresos reales.
+
+**Implementado en `SQL_HISTORIAL`** (`mcp-server/src/tools/ventasCliente.js`):
+nueva CTE `facturas_dedup` que descarta una fila de `facturas` SOLO
+cuando: (a) su `tipo_movimiento` está vacío, Y (b) existe OTRA fila del
+MISMO `customer_code` + MISMO día (`fecha_creacion::date`) + MISMO
+`total` EXACTO con `tipo_movimiento` poblado. Nunca descarta una fila con
+`tipo_movimiento` poblado (así que 2 ventas reales coincidentes del mismo
+cliente/día/monto, ambas con tipo_movimiento poblado, nunca se tocan — no
+hay forma de que esto sea un duplicado según el patrón real encontrado).
+`SQL_NOTAS_CREDITO` no necesitó cambios — exige `tipo_movimiento =
+'out_refund'` (siempre poblado), estructuralmente inmune a este patrón.
+
+### Validación con el caso real exacto
+
+```
+ANTES:   3,990 unidades / $5,990.68
+DESPUÉS: 3,235 unidades / $4,820.44  ← coincide EXACTO con lo que contó Kenny a mano
+3,235 - 125 (regalía $0, sin tocar) = 3,110 netas  ← también exacto
+```
+
+### 🚨 Hallazgo al cuantificar el impacto del fix — el problema es MÁS GRANDE de lo estimado y está ESCALANDO RÁPIDO (para revisar después, no bloqueó este fix)
+
+El caso de Kenny usó el patrón `FAM#` (37 documentos conocidos) para
+encontrar la causa, pero la regla de deduplicación real (customer+día+
+monto exacto, sin importar el prefijo del código) atrapa un universo
+MUCHO más grande:
+
+```sql
+-- documentos excluidos por la nueva regla, sistema completo:
+743 documentos, $16,707.01 total
+  2025-05: 1 doc,   $0.54
+  2026-08: 40 docs, $1,425.84
+  2026-09: 702 docs, $15,280.63   ← 94.5% del total, en UN solo mes
+```
+
+De 40 documentos en agosto a 702 en septiembre — un salto de ~17.5x en un
+mes. Esto es un problema de SYNC activo y empeorando rápido, no un
+artefacto histórico estable. **No se investigó la causa de fondo** (por
+qué `sincronizacionService.js`/el flujo de Odoo está generando 2
+documentos para la misma venta) — pedido explícito del usuario de no
+desviarse a eso ahora, queda anotado acá para revisar aparte, con
+urgencia dado el ritmo de crecimiento.
+
+### Validación técnica
+
+`seguridad-smoke-test` OK, `oauth-smoke-test` OK (17 tools, sin cambios
+— este fix no registra tools nuevas), `notasCredito-real.test.js` sigue
+con el mismo drift de datos preexistente YA CONOCIDO (confirmado
+corriendo el mismo test contra el `ventasCliente.js` SIN el fix — falla
+exacto igual, -$316,613.12 en ambos casos — no es una regresión de este
+cambio). Nuevo `ventasClienteFacturasDuplicadas-real.test.js` (8
+aserciones, incluye sanity check de que el par de documentos gemelos
+original sigue existiendo) en verde.
+
+### Fuera de alcance, decisión explícita
+
+Solo se tocó `ventasCliente.js`, pedido explícito del usuario ("no lo
+mezcles con el #11"). El mismo patrón de duplicación probablemente
+afecta OTRAS tools que suman `facturas` sin deduplicar (`ventasPorGrupo`,
+`ventasPorCondicionPago`, `resumenDiario`, etc.) — NO se tocaron, fuera
+de alcance de este fix puntual. La causa de fondo en el sync tampoco se
+investigó (ver hallazgo de arriba) — ambas cosas quedan como trabajo
+futuro, no bloquean este fix.
+
+## 🔍 Causa raíz de los documentos duplicados en `facturas` — investigación (2026-10-01, SOLO DIAGNÓSTICO, sin fix todavía)
+
+Pedido explícito del usuario tras el PR #12 (fix de síntoma en
+`ventasCliente.js`, ya cerrado y separado — NO tocado acá): investigar
+por qué el sync genera 2 filas de `facturas` para la misma venta real.
+Todo lo de abajo es lectura de código + consultas SQL directas contra
+`ventas_mv`, sin cambios de código.
+
+### Mecanismo exacto (confirmado leyendo el código fuente)
+
+`facturas.code` es **primary key** (`backend/models/factura.js:5-7`).
+Dos procesos de sync, completamente independientes, escriben a esa
+misma tabla con su PROPIO criterio de `code`, sin ninguna lógica de
+reconciliación entre ellos:
+
+- **MobilVendor** (`backend/services/sincronizacionService.js:650-668`,
+  función `syncDocumento`): `code = normalizeCode(doc.code)` — lo que
+  sea que la API de MobilVendor reporte como código del documento en
+  ESE momento. Nunca setea `tipo_movimiento` ni `odoo_id` en el payload.
+- **Odoo** (`backend/services/odooServicio/sincronizacionOdooService.js:717-719`,
+  dentro de `procesarChunkFacturas`): `code = factura.name` (la
+  secuencia fiscal oficial de Odoo, ej. `FA001-106-000000142`),
+  `odoo_id = factura.id`, `tipo_movimiento = factura.move_type`.
+
+Ambos corren en **paralelo** vía `Promise.allSettled` en
+`backend/cron/tareasCron.js:79-82`, dos veces al día (00:00 y 12:00
+America/Guayaquil), cada uno sincronizando una ventana retroactiva de
+`DIAS_RETRO=10` días (`backend/cron/tareasCron.js:160-177`) — es decir,
+cada documento se re-sincroniza (upsert, no insert) hasta ~20 veces en
+sus primeros 10 días de vida.
+
+**El bug**: cuando el `code` que reporta MobilVendor para un documento
+NO coincide textualmente con el `factura.name` que luego asigna Odoo
+para esa misma venta, el upsert de Odoo no "encuentra" la fila de
+MobilVendor (claves primarias distintas) — crea una fila NUEVA en vez de
+actualizar la existente. Quedan 2 filas permanentes para 1 venta real:
+una con `tipo_movimiento` vacío y `odoo_id` NULL (la escribió
+MobilVendor), otra con ambos poblados (la escribió Odoo). Confirmado al
+100%, sin una sola excepción, sobre los 753 pares gemelos detectados en
+todo el histórico:
+
+```sql
+ total | vacio_con_odoo_id | lleno_con_odoo_id
+-------+--------------------+-------------------
+   753 |                  0 |               753
+```
+
+(`auth_code` no sirve como señal — nunca lo pobla MobilVendor en
+ningún documento, de los 63,531 que tiene: es un campo muerto para ese
+origen, no algo específico de este bug.)
+
+**Importante — no es solo "MobilVendor vs. Odoo"**: en el 38% de los
+753 pares (289 de 753), la fila "llena" (con gemelo) también es
+`origen_sistema='MOBILVENDOR'`, no Odoo. Es decir, en más de un tercio
+de los casos MobilVendor mismo reportó DOS valores de `code` distintos
+para la misma venta en sincronizaciones distintas (probablemente un
+código interno/borrador que luego cambia a uno final) — nuestro upsert,
+al no tener ningún identificador estable aparte del `code` cambiante,
+crea una fila nueva para cada valor que ve, en vez de reconocer "este es
+el mismo documento, solo cambió su código". Esto apunta a que la causa
+raíz NO es únicamente una carrera de tiempos Odoo-vs-MobilVendor, sino
+una falla de diseño más general: `facturas.code` no es un identificador
+estable del documento a lo largo de su ciclo de vida, pero se usa como
+primary key.
+
+### Respuesta a las 3 preguntas
+
+**1. ¿Un mismo proceso crea 2 códigos, o son 2 procesos/fuentes
+distintas escribiendo para el mismo hecho de venta?**
+Son **dos procesos independientes** (`sincronizacionService.js` para
+MobilVendor, `sincronizacionOdooService.js` para Odoo) que NUNCA se
+coordinan entre sí para una misma venta — cada uno hace upsert con su
+propio criterio de `code`, sin ningún FK ni lookup cruzado (`parent_id`
+existe en el schema pero está vacío en el 100% de los pares
+investigados — no se usa para esto). Pero el hallazgo del 38% de arriba
+muestra que ADEMÁS hay un segundo mecanismo: el propio MobilVendor
+parece reportar más de un valor de `code` para el mismo documento a lo
+largo de su ciclo de vida, y cada valor nuevo genera su propia fila.
+
+**2. ¿Por qué aceleró ~17.5x en septiembre vs. agosto?**
+Confirmado con el conteo mensual completo desde enero 2025 (21 meses):
+la tasa de duplicación fue **consistentemente <1%** (0-63 documentos
+"vacíos" de 7,000-13,000/mes) desde enero 2025 hasta julio 2026 — esto
+NO es un problema crónico que simplemente no tenía volumen para
+mostrarse, es un cambio real de comportamiento:
+
+```
+2026-07: 6,952 docs MobilVendor, 0 "vacíos"      (0.0%)
+2026-08:    47 docs MobilVendor, 47 "vacíos"     (100%, pero volumen casi nulo)
+2026-09: 5,079 docs MobilVendor, 782 "vacíos"    (15.4%)
+```
+
+Agosto fue un mes con el sync de MobilVendor casi completamente roto
+(bug de sesión inválida reportando `SUCCESS` con 0 documentos en
+silencio — commits `7550185`/`4cd22d3`, corregidos recién el
+2026-08-31). Pero septiembre NO fue una simple "vuelta a la normalidad"
+— el desglose diario muestra que el problema continuó gran parte del
+mes:
+
+```
+Sept 1-25:  volumen diario muy bajo (0-109 docs/día, la mayoría de los
+            días con volumen >0 salen CASI 100% "vacíos") — con la
+            excepción del 17-sep (591 docs, 0.5% vacío, un día sano
+            aislado)
+Sept 26-27: 229 y 51 docs/día, mezcla
+Sept 28-30: 1,227-1,306 docs/día (recién vuelve al volumen normal,
+            ~parecido a julio escalado a 3 días) con 6-8% de vacíos
+```
+
+Es decir: el fix del 31-ago NO resolvió el problema de fondo del sync
+de MobilVendor — solo dejó de fallar en silencio con 0 documentos.
+Durante casi todo septiembre el volumen siguió anormalmente bajo (con
+los pocos documentos que sí llegaban, casi siempre sin su contraparte de
+Odoo todavía — tasa de "vacíos" cercana al 100% en esos días de bajo
+volumen), hasta que el 28-sep el volumen se recuperó de golpe (~1,300
+docs/día, compatible con una re-sincronización/catch-up del backlog
+acumulado) — y ES ESE catch-up masivo el que concentra la mayoría de los
+702 documentos duplicados de septiembre. No se encontró en los logs de
+cron (`backend/cron/cronLog/2026-09-*.log`) ningún error explícito
+durante los días de bajo volumen — el cron reporta "OK" igual, porque
+una respuesta vacía/incompleta de la API de MobilVendor no lanza
+excepción. **Esto no está confirmado al 100%** (requeriría logging
+específico de cuántos documentos devuelve cada página de la API de
+MobilVendor por corrida, que hoy no se guarda) pero es la explicación
+más consistente con toda la evidencia disponible: un problema de
+disponibilidad/completitud de datos del lado de MobilVendor que persistió
+varias semanas después del fix de sesión del 31-ago, no solo el día del
+corte.
+
+**3. ¿Es exclusivo de documentos `FAM#`, o afecta otros prefijos/fuentes?**
+**No es exclusivo de `FAM#` — lo afecta de forma marginal.** Desglose
+completo de los 753 pares, por prefijo del código "vacío":
+
+```
+FAT12-   163   FAD1112-  23   FAE1-     4   FAH10-   2
+FAT4-    159   FAM6-     12   FAM2-     4   (+ 7 prefijos con 1-2 casos)
+FAT3-    133   FAE4-     10   FAT9-     4
+FAR1-     93   FADU1-    10   FAD9-     2
+FAD56-    65   FAM4-     10   FADM3-    2
+FAR5-     34   FAD8-      9   FAV7-     7
+```
+
+TIENDAS (prefijo `T`) concentra el **61%** de los casos (463/753),
+RURAL (`R`) el **17%** (127/753), DOMICILIO (`D`) el **15%** (111/753).
+Los prefijos `FAM#` (MAYORISTAS) que originaron el reporte de Kenny son
+apenas el **3.5%** del total (26/753) — fueron los primeros en notarse
+por el volumen de ese cliente/producto puntual, no porque el patrón sea
+propio de ese canal. Afecta prácticamente todas las rutas/canales que
+pasan por `facturas`, consistente con que la causa es estructural (cómo
+se escribe la tabla), no algo específico de un canal de venta.
+
+### Qué falta para proponer un fix (no se propone nada todavía, a pedido explícito)
+
+1. Confirmar con MobilVendor/soporte si el campo `code` de un documento
+   puede cambiar de valor entre llamadas a la API para el mismo
+   documento interno (explicaría el 38% de pares MobilVendor↔MobilVendor)
+   — hoy es una inferencia a partir del patrón de datos, no algo
+   confirmado con documentación de su API.
+2. Decidir una clave de deduplicación ESTABLE para `facturas` que no
+   dependa de `code` crudo — candidatos: usar `odoo_id` cuando exista
+   como criterio de upsert preferente sobre `code`, o aplicar en el
+   propio sync la misma regla "gemelo" (customer+día+total) que ya usa
+   `ventasCliente.js` como filtro de lectura, pero como MERGE de
+   escritura (actualizar la fila existente en vez de crear una nueva).
+3. Agregar logging de conteo de documentos devueltos por página/sesión
+   en el sync de MobilVendor, para poder confirmar (no solo inferir) la
+   hipótesis de disponibilidad de datos de septiembre si se repite.
+4. Una vez decidido el enfoque, aplicar el mismo patrón de "no tocar
+   nada que no haga falta" usado en el fix de `ventasCliente.js`: el fix
+   real va en el SYNC (evitar que la fila duplicada se cree), lo cual
+   automáticamente resuelve el síntoma para TODAS las tools afectadas
+   (`ventasPorGrupo`, `ventasPorCondicionPago`, `resumenDiario`, etc. —
+   ver sección "Fuera de alcance" arriba), no solo `ventasCliente.js`.
+
+## 📐 Propuesta de diseño — reconciliación de `facturas` MobilVendor↔Odoo (2026-10-01, SOLO PROPUESTA, sin implementar — para revisión de Alberto)
+
+Pedido explícito del usuario: antes de tocar el sync (afecta la primary
+key de una tabla que leen 15+ tools), escribir la propuesta completa
+para que Alberto la revise. **Nada de lo de abajo está implementado.**
+Todo lo marcado como "confirmado" viene de consultas SQL directas contra
+`ventas_mv` o de leer el código fuente citado; lo marcado como "abierto"
+es una pregunta sin resolver que debe cerrarse antes de escribir código.
+
+### 1) Nueva llave de reconciliación
+
+**`invoice_origin` no sirve** — se revisó como candidato obvio (en Odoo
+estándar suele llevar la referencia a la orden de origen) pero está
+vacío en el 100% de los 753 pares conocidos (`g.invoice_origin = ''` o
+NULL siempre, sin una sola excepción). No hay ningún otro campo ya
+capturado en `facturas`/`doc` que sirva como identificador estable
+cross-sistema — catalogado el payload completo que `syncDocumento` lee
+de la API de MobilVendor (`backend/services/sincronizacionService.js`,
+grep de todos los `doc.*` usados) y no existe un `doc.id`/`doc.uuid`
+interno que estemos capturando hoy.
+
+**🔴 Pregunta abierta #1, bloqueante**: ¿la API de MobilVendor
+(`getInvoices`) devuelve en su respuesta cruda algún campo de id interno
+aparte de `code` (ej. un `id` numérico de MobilVendor que NO cambie
+aunque el código fiscal sí cambie)? Hoy no lo sabemos — nunca se
+inspeccionó/logueó la respuesta completa, solo se leen los campos que ya
+se usan. **Antes de escribir una sola línea de código de este fix, hay
+que loguear una respuesta cruda completa de `getInvoices` (un día
+cualquiera, a un archivo, no a producción) y revisar TODOS los campos
+que trae.** Si existe un id estable, es la solución correcta y barata:
+agregar una columna `mobilvendor_id` a `facturas`, poblarla en el upsert
+de MobilVendor, y usarla (junto con `odoo_id` del lado Odoo, si Odoo
+algún día expone esa referencia) como llave de reconciliación real —
+sin heurística, sin riesgo de colisión.
+
+**Si NO existe tal id (hay que diseñar para ese escenario también)**:
+se probó una llave compuesta candidata — `customer_code + fecha_creacion
+(día) + total exacto` (la misma que ya usa el fix de `ventasCliente.js`
+como heurística de DETECCIÓN) — pero **se confirmó que NO es segura como
+llave de MERGE/reconciliación general**, por un hallazgo nuevo:
+
+```sql
+-- colisiones reales entre documentos YA "llenos" (sin relación con el bug),
+-- mismo customer_code + mismo día + mismo total exacto, 2025-01 a hoy:
+12,049 grupos con colisión, 45,999 documentos involucrados
+```
+
+La colisión es sistemática en **cuentas de cadena/consolidadas** — ej.
+`codigo_cliente 108299` = TIENDAS INDUSTRIALES ASOCIADAS TIA S.A.,
+`110470` = CORPORACIÓN EL ROSADO S.A. — donde decenas de locales/puntos
+de venta distintos facturan bajo el MISMO `customer_code` consolidado,
+y es normal que 26-32 documentos reales y completamente independientes
+compartan cliente+día+monto exacto (ej. muchas tiendas vendiendo el
+mismo producto a $17.25 el mismo día). Agregar `route_code`/
+`seller_code` a la llave casi no ayuda (10,234 grupos siguen
+colisionando — probablemente las cadenas también concentran pocas
+rutas/vendedores). Agregando ADEMÁS una firma de línea de detalle
+(`codigo_producto:cantidad` de `detalle_documento`, ordenada) las
+colisiones bajan mucho pero **no a cero** (506 grupos / 2,354 documentos
+siguen colisionando, solo para TIA en septiembre 2026) — ni siquiera la
+combinación más estricta disponible con los datos de hoy es 100% segura
+para cuentas de cadena.
+
+**Conclusión de este punto**: la llave compuesta (aunque se afine) NO es
+apta para un merge automático sin supervisión en cuentas de cadena —
+solo es segura para la detección puntual que ya usa `ventasCliente.js`
+(que además exige que UN lado tenga `tipo_movimiento` vacío, una señal
+independiente que reduce bastante el riesgo, aunque no lo elimina para
+cadenas). Para el fix de fondo en el sync, la recomendación es:
+1. Confirmar la pregunta abierta #1 (id estable de MobilVendor) — si
+   existe, usarlo y no depender de ninguna heurística.
+2. Si no existe: usar la llave compuesta + firma de detalle_documento
+   SOLO como mecanismo de auto-merge para clientes que NO estén en una
+   lista explícita de cuentas de cadena/consolidadas (ya existe el
+   concepto `incluir_cadenas` en `auditoriaClientes.js` — reusar esa
+   misma clasificación de "cadena" en vez de inventar una nueva). Para
+   clientes de cadena, el emparejamiento queda **sin automatizar** —
+   se reporta aparte para revisión manual, no se fusiona solo.
+
+### 2) Qué hacer con los 753 pares ya duplicados en la base
+
+**No se recomienda borrar ninguna fila.** Tres hallazgos del esquema
+actual descartan un delete directo:
+
+- `detalle_documento` (líneas de producto) está **completo e
+  independiente en AMBOS lados** de cada par — confirmado con los 5
+  primeros pares (ej. `FAT3-000276`: 1 línea propia, `FA001-007-
+  000028251`: 1 línea propia, ninguna compartida). Borrar la fila
+  "vacía" de `facturas` sin antes limpiar/reapuntar sus líneas
+  dejaría `detalle_documento` huérfano (no hay FK formal que lo
+  impida — `information_schema` confirma que NO existe ninguna
+  foreign key declarada hacia `facturas.code` desde ninguna tabla, así
+  que un delete no fallaría ruidosamente, fallaría en silencio dejando
+  basura).
+- **`promo_lineas_venta` depende del código "vacío" en 153 de los 753
+  casos** (169 líneas de promoción en total) — esa tabla la escribe
+  SOLO MobilVendor (`sincronizacionService.js:826`, comentario propio
+  del código: "Odoo nunca la toca → las promos... no se pierden").
+  El lado "lleno"/Odoo NUNCA tiene promos propias. Si se borra o se dejan
+  de leer las filas "vacías" sin reapuntar esto antes, se **pierde la
+  atribución de promoción de 169 líneas reales** — no es un efecto
+  secundario aceptable.
+- Las notas de crédito (`tipo_movimiento='out_refund'`) **ya resuelven
+  correctamente al lado "lleno"** — se confirmó que 0 de las NC
+  conocidas referencian (vía `reversed_entry_id`→`odoo_id`) a una
+  factura "vacía". No hay riesgo de romper notas de crédito con
+  cualquiera de los enfoques de abajo.
+
+**Propuesta**: columna nueva, nullable, en `facturas` — `duplicado_de
+varchar(30)` (mismo tipo que `code`), NULL en el caso normal. Para una
+fila detectada como "vacía" de un par conocido, se setea
+`duplicado_de = <code de la fila "llena">`. Es un **marcado, no un
+borrado**:
+- Todas las tools que hoy suman `facturas`/`detalle_documento` agregan
+  `WHERE f.duplicado_de IS NULL` a su filtro — una fila marcada deja de
+  contar en CUALQUIER agregación, en un solo lugar (la tabla), no en
+  cada tool por separado.
+- `promo_lineas_venta` se reapunta en un paso de backfill aparte (`UPDATE
+  promo_lineas_venta SET documento_code = <code_lleno> WHERE
+  documento_code = <code_vacio>` para los 153 casos) — o, más seguro,
+  se cambia el tool que lee promos para que siga el puntero
+  `duplicado_de` en vez de reapuntar datos. A decidir, pero cualquiera
+  de las dos preserva el dato.
+- **Nada que ya referencie cualquiera de los 2 códigos se rompe** — ni
+  el código "vacío" ni el "lleno" se borran ni se renombran, así que un
+  reporte/Excel/conversación previa con cualquiera de los 2 códigos
+  sigue resolviendo exactamente igual que antes. Es la misma filosofía
+  que ya se usó para `waybill_status` (nunca pisar/borrar, solo marcar).
+- Backfill de los 753 pares históricos: correr la detección ya validada
+  en PR #12 en modo "solo reportar" primero (dry-run, exportar a CSV/
+  tabla de staging), EXCLUYENDO clientes de cadena (ver punto 1), y
+  solo después de una revisión manual aplicar el `UPDATE duplicado_de`
+  real. Los casos de cadena quedan en una lista aparte para revisión de
+  Alberto, no se marcan automáticamente.
+
+### 3) Impacto en otras tools (además de `ventasCliente`, ya resuelto en PR #12)
+
+Catalogadas las 17 tools del MCP por si leen `facturas` y si **suman**
+dólares/unidades (no solo existencia/fecha, donde un duplicado no
+cambia el resultado):
+
+**Alto riesgo — suman `facturas`/`detalle_documento` sin ningún
+filtro de deduplicación, mismo patrón exacto que tenía
+`ventasCliente.js` antes del PR #12:**
+- `ventasPorGrupo.js`, `ventasPorCondicionPago.js`,
+  `ventasPorRutaCondicion.js`, `resumenDiario.js`, `topProductos.js`,
+  `ventasPorRuta.js`, `clientesPorGrupo.js` — todas con `SUM(dd.cantidad)`/
+  `SUM(dd.total)` sobre `detalle_documento` unido a `facturas` vía
+  `CASE_GRUPO_FACTURAS`, sin CTE de dedup.
+- `ventasRutaOk.js` — suma `facturas.total` directo (sin pasar por
+  `detalle_documento`). Nota aparte: este tool YA tiene una decisión
+  explícita de Alberto (2026-09-22, comentario en el código línea 11-23)
+  de publicar números "tal cual" sin deduplicar, pero esa decisión es
+  sobre un problema DISTINTO (posible doble conteo COTTSA vs.
+  aqua-premium-ne) — el problema de `facturas.code` MobilVendor↔Odoo
+  de este documento lo afecta IGUAL y es independiente de esa decisión.
+
+**Magnitud**: el techo de exposición ya cuantificado (ver sección de
+causa raíz arriba) es **743 documentos / $16,707.01 en todo el histórico
+2025-2026, con $15,280.63 (702 docs, 94.5%) concentrados en septiembre
+2026**. Esto NO se multiplica por 8 tools — es el mismo conjunto de
+filas infladas, repartido distinto según el filtro de fecha/ruta/grupo
+de cada consulta puntual. Una consulta de `ventasPorGrupo` para
+septiembre 2026 sin filtrar por grupo podría mostrar hasta ~$15,280 de
+ese exceso; una consulta acotada a una ruta/grupo específico vería solo
+la porción de esos 702 documentos que caiga en ese filtro. No se calculó
+el desglose exacto por tool (son 8 consultas con filtros distintos) —
+si hace falta el número exacto para alguna tool puntual antes de
+aprobar el fix, se puede sacar con la misma query de pares gemelos de
+la sección de causa raíz, acotada al filtro de esa tool.
+
+**Bajo riesgo / sin riesgo** (no suman dólares de `facturas`, solo
+existencia o fecha — un duplicado no cambia el resultado):
+`auditoriaClientes.js` (usa `facturas` para fecha de última compra /
+actividad, no para sumar), `clientesSinVisita.js`, `clientesInactivos.js`,
+`clientesSinConsumo.js`, `clientesVisitadosSinVenta.js`,
+`backlogPrevendedores.js` (el `JOIN facturas` es solo un `EXISTS`
+booleano — `tiene_factura_cliente_posterior` — el `SUM` real es sobre
+`ordenes`, no `facturas`), `proyeccionMensual.js` (usa `COUNT(*) FROM
+facturas` como umbral mínimo de datos, no como suma de dólares — el
+ruido de 743 documentos extra en 21 meses es insignificante frente al
+volumen diario normal).
+
+El fix de fondo en el sync (una vez implementado) resuelve los 8 tools
+de alto riesgo de una sola vez, sin tocarlos — exactamente como se
+documentó en la sección de causa raíz arriba.
+
+### 4) Por qué el volumen de MobilVendor fue anormalmente bajo casi todo septiembre
+
+**No se encontró una causa concluyente — es un hallazgo aparte que
+necesita su propia investigación**, pero se descartaron las dos causas
+más obvias con evidencia directa:
+
+- **No es el bug de sesión ya conocido.** El fix generalizado (reintento
+  por página) se desplegó el 2026-08-31 15:48 UTC y se auditó
+  específicamente — "Punto 5 de la checklist" en este mismo archivo —
+  contra `sincronizaciones_ventas` real, con **cero coincidencias** del
+  patrón del bug hasta el 2026-09-01 17:00 UTC. Durante TODO septiembre
+  el registro durable de reintentos (`errores_sync.txt`, dentro del
+  contenedor `dashboard_backend`) solo tiene **4 entradas** de sesión
+  sospechosa (24-sep, 25-sep, 28-sep, 30-sep), todas de **1 sola
+  página** (`pag1/1` — ya indica volumen bajo ESE día, no al revés) y
+  sin error posterior registrado — es decir, el mecanismo de reintento
+  funcionó y se recuperó cada vez. No hay evidencia de que el código de
+  sync esté fallando silenciosamente.
+- **No es el backfill 2025.** Terminó y reconcilió los 12 meses el
+  2026-09-02 07:09 -05 (ver sección "Backfill 2025 COMPLETADO" arriba)
+  — no compitió por sesión/recursos con el cron diario durante el resto
+  de septiembre, que es cuando persiste el volumen bajo (3-25 sept).
+
+**Lo que sí se confirmó, con datos reales**:
+- El volumen de **Odoo** (`origen_sistema='ODOO'`) fue NORMAL y estable
+  durante todo septiembre (800-1,400 facturas/día entre semana, caídas
+  esperadas los sábados) — **hasta el 28-sep, cuando CAYÓ** a 196/181/91
+  justo los 3 días en que MobilVendor **saltó** a 1,227-1,306
+  documentos/día (el catch-up). Este patrón inverso (Odoo cae justo
+  cuando MobilVendor se dispara) es un hallazgo nuevo, no documentado
+  antes — sugiere que ambos sync compiten por un recurso compartido
+  (conexiones de Postgres, CPU del proceso Node, o ambos corriendo
+  `Promise.allSettled` en el mismo event loop) cuando uno de los dos
+  tiene que procesar un volumen inusualmente alto de una sola vez.
+- Durante el 1-25 de septiembre, el volumen bajo de MobilVendor (0-109
+  docs/día, la mayoría casi 100% "vacíos" cuando hay documentos) ocurre
+  SIN ningún error visible en los logs de cron (`backend/cron/cronLog/
+  2026-09-*.log`, todos "TODO OK" o con errores ajenos a MobilVendor/
+  Odoo) ni en `errores_sync.txt`. Esto apunta a que la API de
+  MobilVendor simplemente **no tenía los documentos disponibles para
+  entregar** en esas fechas durante esas 3-4 semanas (un atraso del
+  lado de MobilVendor, externo a nuestro sync) — pero esto es una
+  **inferencia, no una confirmación**: requeriría loguear el conteo de
+  documentos devueltos por página en cada corrida (no se guarda hoy)
+  para confirmarlo con certeza, o consultar directamente con soporte de
+  MobilVendor si hubo algún atraso/cola de procesamiento de su lado en
+  ese rango de fechas.
+
+**Recomendación**: tratar esto como una investigación separada, NO
+bloqueante para el fix de reconciliación de `facturas` (son causas
+distintas — una es qué pasa cuando los 2 sync escriben la misma venta
+dos veces, otra es por qué un sync a veces no ve la venta a tiempo).
+Para investigarlo bien: (a) agregar logging explícito de
+`headers.length` por página en cada corrida de `sincronizarVentasRango`
+(hoy solo se loguea en consola, no de forma durable/consultable), y
+(b) preguntar a MobilVendor/soporte si hay un registro de su lado de
+cuándo cada documento quedó disponible vía API — compararlo contra nuestro
+`fecha_creacion` para medir el lag real.
+
+### Estado
+
+**Nada de lo anterior está implementado.** Pendiente de revisión de
+Alberto antes de autorizar cualquier cambio al sync (toca la primary
+key de una tabla compartida por 8+ tools). Una vez aprobado el enfoque
+(llave de reconciliación + qué hacer con los 753 pares existentes), se
+implementa en un PR aparte, con su propio plan de rollback dado que
+toca una tabla en producción activamente escrita 2x al día.
+
+## 🚨 Medición urgente — impacto real en `resumenDiario` (reporte semanal a CIRE) — 2026-10-01, SOLO MEDICIÓN, sin fix
+
+Pedido explícito del usuario, con prioridad sobre el resto del diseño
+de arriba: `resumenDiario.js` alimenta el reporte semanal que se le
+manda a CIRE — hay que saber si los números ya comunicados están
+inflados, por cuánto, y desde cuándo, antes de seguir resolviendo la
+llave de reconciliación.
+
+### Metodología
+
+Se reconstruyó exactamente `SQL_DIA` de `resumenDiario.js` (mismo
+`CASE_GRUPO_ORDENES`/`CASE_GRUPO_FACTURAS`/`FILTRO_ORDENES_GRUPO_VALIDO`/
+`FILTRO_CLIENTE_VALIDO`/`GRUPOS_VALIDOS` importados del mismo
+`clasificacion.js`, no reescritos a mano) agregada por semana calendario
+(lunes-domingo) en vez de por día, y se corrió 2 veces por semana: una
+tal cual (CON duplicados) y otra agregando la misma condición de
+exclusión ya validada en el PR #12 (`facturas_dedup`: excluye la fila
+con `tipo_movimiento` vacío cuando existe una gemela con mismo
+customer_code+día+total exacto y `tipo_movimiento` poblado). La
+diferencia entre ambas es el monto exacto que `resumenDiario` está
+sobrecontando por semana. Las 6 semanas elegidas son las últimas 6
+semanas calendario YA CERRADAS antes de hoy (jueves 2026-10-01) — la
+última semana completa termina el domingo 2026-09-27.
+
+### 1) Monto exacto de la diferencia, semana por semana
+
+| Semana (lun-dom) | CON duplicados | SIN duplicados | Diferencia | % |
+|---|---|---|---|---|
+| 17-23 ago | $220,800.65 | $220,800.65 | **$0.00** | 0.000% |
+| 24-30 ago | $216,700.50 | $216,616.85 | **$83.65** | 0.039% |
+| 31 ago-6 sep | $251,637.02 | $251,541.58 | **$95.44** | 0.038% |
+| 7-13 sep | $248,413.59 | $247,830.20 | **$583.39** | 0.235% |
+| 14-20 sep | $238,841.80 | $237,850.50 | **$991.30** | 0.415% |
+| **21-27 sep** (última semana ya reportada) | $201,173.66 | $196,099.76 | **$5,073.90** | **2.522%** |
+| **TOTAL 6 semanas** | **$1,377,567.22** | **$1,370,739.54** | **$6,827.68** | **0.496%** |
+
+**Dato adicional, no pedido pero relevante para la decisión**: la
+semana EN CURSO (28-sep a hoy, 2026-10-01, parcial — 4 días, TODAVÍA NO
+reportada) ya acumula **$4,611.31** de diferencia sobre $96,307.93
+(**4.788%**) — más alto que cualquier semana ya cerrada. Esto es
+esperable: la sección de causa raíz de arriba ya documentó que el
+catch-up masivo de MobilVendor se concentró el 28-30 de septiembre, y
+esos días caen en esta semana todavía no reportada.
+
+### 2) ¿Es material?
+
+**Depende de qué se esté mirando.** El acumulado de las 6 semanas
+($6,827.68 sobre $1,377,567.22, 0.496%) es **marginal** — no cambiaría
+ninguna cifra ni decisión basada en el agregado de 6 semanas. PERO la
+cifra NO es estable: crece de $0 a $5,073.90 en 6 semanas, de forma
+acelerada (cada semana más que duplica o triplica a la anterior desde
+el 7-sep en adelante), y la semana más reciente YA REPORTADA
+individualmente (21-27 sep, **2.5%**) y la semana en curso (**4.8%**,
+y todavía no cierra) ya NO son marginales como cifra semanal
+individual — son órdenes de magnitud más grandes que cualquier semana
+de agosto. **La pregunta correcta no es "¿el acumulado importa?" sino
+"¿la tendencia, de seguir así, hace que el próximo reporte (semana
+28-sep al 4-oct) muestre un número significativamente inflado?" — y la
+respuesta con los datos de hoy es que sí probablemente**, dado que ya
+lleva 4.8% de diferencia con solo 4 de 7 días de la semana cerrados.
+
+### 3) Fecha de corte
+
+Confirma exactamente el mismo patrón que el hallazgo original de
+`ventasCliente.js`: **no afecta meses anteriores a septiembre de forma
+significativa.** Agosto completo (las 3 semanas de 17-ago a 6-sep que
+caen mayormente en agosto) está entre $0.00 y $95.44 por semana
+(0.00%-0.04%) — ruido, no un problema real. El quiebre empieza la
+semana del 7-13 de septiembre (0.235%, ya claramente distinto de cero)
+y se acelera cada semana sucesiva hasta la última semana reportada
+(2.522%) y la semana en curso (4.788%, y subiendo). **Es,
+consistentemente con el resto de esta investigación, un problema casi
+exclusivo de septiembre 2026 en adelante — no retroactivo a meses
+anteriores.**
+
+### Recomendación (no es una decisión de negocio, es solo para que el usuario decida con cifras exactas)
+
+No se tocó `resumenDiario.js` ni ningún otro código — esto es solo
+medición, tal como se pidió. Con estos números: el reporte YA enviado
+de la semana 21-27 sep tiene ~$5,074 de más (2.5%) que no debería estar
+ahí; si el reporte de la semana en curso (28-sep al 4-oct) se envía sin
+corregir, la proyección con los 4 días ya medidos sugiere que podría
+estar en el rango de $4,600-$9,000+ de más, dependiendo del
+comportamiento de los próximos 3 días. Queda a criterio del usuario si
+eso amerita un aviso a CIRE antes de que se cierre y envíe esa semana,
+independientemente de cuándo se resuelva la llave técnica de fondo.
+
+## 📐 Propuesta de diseño COMPLETA — reconciliación de `facturas` (2026-10-01, SOLO PROPUESTA, sin implementar — para revisión de Alberto)
+
+Continuación de la propuesta de arriba: se resolvió la pregunta
+bloqueante #1 probando en vivo contra la API real de MobilVendor y
+contra Odoo (lecturas puras, sin escribir nada) — esto cambia la
+recomendación de la llave de reconciliación. Con eso resuelto, se
+completa el diseño de los 3 puntos pendientes.
+
+### Pregunta bloqueante #1 — RESUELTA con evidencia en vivo
+
+**Sí existe un id interno estable en la API de MobilVendor, no
+capturado hoy.** Se logueó contra `https://s31.mobilvendor.com/web-service`
+con las credenciales reales (`MV_USUARIO`/`MV_CLAVE`/`MV_CONTEXTO`, ya en
+`.env` del backend) y se pidió `getInvoices` para un documento real —
+la respuesta cruda trae un campo **`id`** (ej. `"id": "840127"`),
+numérico, de la propia base de datos de MobilVendor, **completamente
+separado de `code`** — nunca se captura hoy (confirmado: ningún
+`doc.id` se lee en `sincronizacionService.js`). También se confirmó que
+la respuesta cruda trae `access_code`/`auth_code` (la clave de acceso
+SRI de 49 dígitos) ya poblados del lado MobilVendor — tampoco se
+capturan hoy hacia `facturas.auth_code` (por eso esa columna está en
+0/63,531 para MobilVendor, como se documentó en la sección de causa
+raíz — no es que MobilVendor no tenga el dato, es que nuestro sync
+nunca lo lee).
+
+**Pero la mitad del problema NO se resuelve con esto.** Se buscó
+también un puente YA EXISTENTE del lado Odoo — y lo hay, pero está
+roto: `account.move` tiene un campo custom llamado **`mobilvendor_id`**
+(alguien, en algún momento, pensó exactamente en este problema). Se
+leyó en vivo contra Odoo (XML-RPC, mismas credenciales del backend) para
+los 15 pares gemelos de la sección anterior más una muestra amplia de
+300 facturas recientes sin relación con el bug — **resultado: en el
+100% de los casos (0 excepciones de 300), `mobilvendor_id` es idéntico
+a `name` (o está vacío) — nunca contiene el código nativo real de
+MobilVendor.** Es un campo muerto/espejo, no un puente funcional. No se
+investigó POR QUÉ está roto (quién lo llena, qué automatización de Odoo
+lo escribe) — eso es trabajo de quien mantenga esa integración del lado
+Odoo (posiblemente tema para Alberto o el implementador de Odoo), no
+algo que se pueda arreglar desde este repo.
+
+**Conclusión**: el id interno de MobilVendor resuelve el 38% de los
+pares que son MobilVendor-contra-sí-mismo (mismo documento real,
+reportado con 2 `code` distintos en 2 sync distintos) de forma
+determinística y permanente. El 62% restante (MobilVendor-contra-Odoo)
+**sigue sin un puente técnico confiable** — no hay ningún campo, ni en
+MobilVendor ni en Odoo, que hoy conecte de forma determinística un
+documento de un sistema con su par en el otro. Para ese 62% la única
+opción disponible es la llave compuesta + exclusión de cadenas ya
+propuesta arriba, como mitigación, no como solución definitiva — la
+solución definitiva de ese 62% depende de un cambio FUERA de este
+repo (que el `mobilvendor_id` de Odoo se llene de verdad, o que la
+integración Odoo↔MobilVendor exponga algo equivalente).
+
+### Llave de reconciliación definitiva (two-tier, dado lo de arriba)
+
+**Tier 1 — determinístico, sin heurística, implementable ya:**
+capturar el `id` crudo de MobilVendor en una columna nueva
+`facturas.mobilvendor_internal_id` (poblada SOLO por el upsert de
+`sincronizacionService.js`, nunca por Odoo). En `syncDocumento`, antes
+del `Factura.upsert` actual (keyed por `code`), agregar un `SELECT code
+FROM facturas WHERE mobilvendor_internal_id = :id AND code <> :code
+LIMIT 1`: si existe, es el MISMO documento real que ya vimos con un
+`code` anterior — se hace `UPDATE` de esa fila (incluyendo el nuevo
+`code`) en vez de insertar una fila nueva. Esto previene
+**permanentemente** el 38% de duplicados MobilVendor-contra-sí-mismo,
+desde el momento en que se despliega, sin depender de nada externo.
+
+**Tier 2 — heurístico, con supervisión, para el 62% restante:**
+sin un puente real a Odoo, se mantiene la detección por
+`customer_code + fecha_creacion (día) + total exacto`, EXCLUYENDO
+clientes de cadena (mismo criterio `incluir_cadenas` de
+`auditoriaClientes.js`). Para clientes de cadena, el par se reporta en
+una tabla de revisión manual, nunca se marca solo. Esto corre como un
+**job programado** (no en el sync en tiempo real, porque depende de que
+AMBOS lados —MobilVendor y Odoo— ya hayan escrito su versión del
+documento, lo cual puede tardar horas/días) — propuesta: correrlo una
+vez al día, después del cron de las 00:00, sobre la ventana de los
+últimos `DIAS_RETRO` días (igual que el sync), marcando `duplicado_de`
+en los pares nuevos que encuentre.
+
+### Mecanismo `duplicado_de` para los 753 pares existentes (sin cambios respecto a la propuesta anterior, repetido aquí para que el documento quede completo)
+
+Columna nueva `facturas.duplicado_de varchar(30)` nullable — NO se
+borra nada. Backfill de los 753 pares históricos en modo dry-run
+primero (CSV de revisión), excluyendo cadenas, luego `UPDATE
+duplicado_de` real. `promo_lineas_venta` se reapunta al código "lleno"
+para los 153 casos que lo tienen. Nada que ya referencie cualquiera de
+los 2 códigos se rompe (ver detalle completo en la sección anterior).
+
+### Plan concreto para aplicar el fix a las 8 tools
+
+**Un solo punto de cambio, no 8.** Se agrega a `mcp-server/src/sql/
+clasificacion.js` (la misma fuente única que ya define
+`CASE_GRUPO_FACTURAS`/`FILTRO_CLIENTE_VALIDO`) una constante nueva:
+
+```js
+const FILTRO_FACTURAS_NO_DUPLICADO = "f.duplicado_de IS NULL";
+```
+
+Cada una de las 8 tools (`ventasPorGrupo.js`, `ventasPorCondicionPago.js`,
+`ventasPorRutaCondicion.js`, `resumenDiario.js`, `topProductos.js`,
+`ventasPorRuta.js`, `clientesPorGrupo.js`, `ventasRutaOk.js`) agrega
+**una sola línea** a su(s) `WHERE` existente sobre `facturas` (alias
+`f`): `AND ${FILTRO_FACTURAS_NO_DUPLICADO}` — igual de mecánico que el
+`FILTRO_CLIENTE_VALIDO` que ya usan todas. Cero cambios de lógica de
+negocio en cada tool individual — todas siguen agregando exactamente
+igual, solo dejan de sumar las filas marcadas.
+
+**Orden de implementación propuesto** (cada paso es reversible y no
+depende de que el siguiente esté listo):
+1. Migración aditiva: columna `duplicado_de` (nullable, sin default) +
+   columna `mobilvendor_internal_id` en `facturas`. Sin comportamiento
+   nuevo hasta que se pueblen — cero riesgo para producción.
+2. Backfill dry-run de los 753 pares conocidos (CSV, excluyendo
+   cadenas) → revisión manual → `UPDATE duplicado_de` real +
+   reapuntar `promo_lineas_venta` (153 casos).
+3. Fix en `sincronizacionService.js` (Tier 1): capturar
+   `mobilvendor_internal_id`, lógica de "buscar por internal_id antes
+   de upsert por code". Esto detiene el sangrado del 38% desde el día
+   que se despliega.
+4. Agregar `FILTRO_FACTURAS_NO_DUPLICADO` a `clasificacion.js` + 1
+   línea en cada una de las 8 tools. Correr la suite completa de cada
+   tool afectada antes de desplegar (ya existen tests `-real.test.js`
+   para la mayoría).
+5. Job programado (Tier 2) para los pares nuevos no-cadena que sigan
+   apareciendo por el lado MobilVendor-vs-Odoo, corriendo después del
+   cron diario.
+6. Plan de rollback: cada paso es aditivo/no-destructivo — revertir es
+   dejar de filtrar por `duplicado_de` (1 línea por tool) y/o dejar la
+   columna sin poblar; nunca hay que deshacer un delete porque nunca se
+   borra nada.
+
+### Estado
+
+~~Nada de lo anterior está implementado~~ → **Implementado completo**
+(2026-10-01, autorizado explícitamente por el usuario tras revisar esta
+propuesta — "autorizado para implementar completo", las 2 capas +
+`duplicado_de` + el filtro en las 8 tools). Ver la sección siguiente
+("✅ Implementación...") para el detalle de qué se construyó, cómo se
+validó, y los resultados reales del backfill. **Rama
+`fix/reconciliacion-facturas-mobilvendor-odoo`, PR nuevo — NO mergeado
+ni desplegado todavía**, eso se autoriza aparte cuando esté listo (igual
+que el resto de este flujo de trabajo).
+
+## ✅ Implementación completa — reconciliación de `facturas` (2026-10-01)
+
+Siguiendo exactamente el orden de implementación propuesto arriba. Todo
+verificado en vivo contra `ventas_mv` (no solo `node --check`) antes de
+dar cada paso por terminado — se encontraron y corrigieron 2 bugs reales
+durante la validación (ver abajo), ninguno habría aparecido con solo
+revisión de código.
+
+### 1. Migración (`backend/sql/000_schema.sql`, `backend/models/factura.js`)
+
+`facturas.duplicado_de VARCHAR(30)` (FK autorreferencial a
+`facturas(code)`, `ON DELETE SET NULL`) + `facturas.mobilvendor_internal_id
+VARCHAR(30)`, ambas nullable, con sus índices parciales. Tabla nueva
+`facturas_duplicados_revision_manual` para los casos ambiguos (ver
+punto 3). Corrida en vivo contra `ventas_mv` — limpia, sin errores,
+100% idempotente (ya validado con `backend/sql/000_schema.sql` completo
+corriendo 2 veces).
+
+### 2. Tier 1 — `backend/services/sincronizacionService.js` (`syncDocumento`)
+
+Captura `doc.id` (el id interno de MobilVendor) en
+`mobilvendor_internal_id`. Antes de cada upsert de tipo factura, busca
+si ya existe una fila con el mismo `mobilvendor_internal_id` bajo OTRO
+`code` — si existe, la marca `duplicado_de` apuntando al `code` nuevo
+**DESPUÉS** del upsert (no antes).
+
+**🐛 Bug real encontrado validando en vivo**: la primera versión hacía
+el `UPDATE duplicado_de` ANTES del upsert de la fila nueva — la FK
+`fk_facturas_duplicado_de` lo rechazaba (`duplicado_de` no puede apuntar
+a un `code` que todavía no existe). Reproducido con un caso sintético
+real (insertar 2 filas de prueba con el mismo `mobilvendor_internal_id`,
+confirmar el error, corregir el orden, confirmar que ya no pasa) —
+corregido invirtiendo el orden (upsert primero, marcar después). Sin
+este caso de prueba en vivo el bug habría llegado a producción (pasaba
+`node --check` sin problema, es un error de lógica/orden, no de
+sintaxis).
+
+### 3. `duplicado_de` + backfill de los 753 pares existentes
+
+`ops/facturas-duplicados/backfill_duplicados.js` — detección por
+cliente+día+total (1 lado `tipo_movimiento` vacío, el otro poblado),
+con el gate de seguridad 1-a-1 bidireccional propuesto arriba (evita
+marcar automáticamente cuentas de cadena). Dry-run primero, después
+`--aplicar`.
+
+**🐛 Segundo bug real encontrado validando en vivo**: la primera corrida
+en dry-run reportó **0 casos seguros, 763 ambiguos** — contradecía por
+completo la medición de la sección de causa raíz (740/749 esperados como
+seguros). Causa: `pg` devuelve `COUNT(*)` (bigint) como **string**, y la
+comparación `=== 1` en JS nunca es cierta contra `"1"` — todo caía en
+"ambiguo" por el bug, no por ser realmente ambiguo. Corregido con
+`Number()` antes de comparar; re-validado contra una query SQL directa
+equivalente (mismo resultado exacto, 738/25) antes de confiar en el
+script. El mismo fix se aplicó en
+`backend/services/reconciliacionFacturasService.js` (Tier 2, construido
+después, se escribió ya con el fix incluido).
+
+**Resultado real del backfill** (corrido en producción, dentro de una
+transacción):
+```
+Candidatos totales          : 763
+Marcados duplicado_de       : 738   ($16,623.31)
+Líneas de promo reapuntadas : 165   (promo_lineas_venta.documento_code)
+A revisión manual           : 25    (facturas_duplicados_revision_manual)
+```
+(738 vs. los 740 estimados en la sección de causa raíz — la diferencia
+es esperable: son mediciones en momentos distintos, con el sync
+corriendo en paralelo entre medio.)
+
+### 4. Tier 2 — job diario (`backend/services/reconciliacionFacturasService.js` + `backend/cron/tareasCron.js`)
+
+Misma lógica de detección que el backfill (de hecho el backfill USA la
+misma query), scopeada a los últimos `DIAS_RETRO` días. Se agregó como
+paso 5 de `ejecutarSincronizacion()` en `tareasCron.js`, **corriendo en
+los 2 ciclos diarios (00:00 y 12:00)** — no solo el de medianoche como
+decía la propuesta original: es idempotente (`duplicado_de IS NULL` en
+el filtro) y correr 2 veces al día en vez de 1 reduce a la mitad el
+tiempo máximo que un duplicado nuevo queda sin marcar, sin costo
+adicional real. Validado en vivo tras el backfill: 0 nuevos "seguros"
+(correcto, ya no quedaba ninguno dentro de la ventana), 10 ambiguos
+detectados y agregados a la tabla de revisión (sin duplicar los que ya
+estaban — `ON CONFLICT DO NOTHING` confirmado funcionando).
+
+### 5. Filtro compartido en las 8 tools (`mcp-server/src/sql/clasificacion.js` + 8 archivos en `mcp-server/src/tools/`)
+
+`FILTRO_FACTURAS_NO_DUPLICADO(aliasFacturas)` agregado a
+`clasificacion.js` (mismo patrón que `FILTRO_CLIENTE_VALIDO`), una línea
+agregada al `WHERE` de cada bloque de `facturas` en `ventasPorGrupo.js`,
+`ventasPorCondicionPago.js` (2 bloques), `ventasPorRutaCondicion.js` (4
+bloques), `resumenDiario.js` (2 bloques), `topProductos.js` (2 bloques),
+`ventasPorRuta.js`, `clientesPorGrupo.js`, `ventasRutaOk.js` — 14
+bloques en total, todos verificados 1:1 contra el conteo de `FROM
+facturas f` en cada archivo (ninguno quedó sin el filtro).
+
+### Validación — suite completa
+
+`node --check` en los 16 archivos tocados, limpio. Suite real contra
+`ventas_mv`:
+- `test:seguridad`, `test:oauth` — OK (17 tools sin cambios de registro).
+- `test:condicion-pago-real`, `test:ventas-ruta-ok-real`,
+  `test:clasificacion-ruta-combinada-real`,
+  `test:fallback-odoo-condicion-real`,
+  `test:clasificacion-domicilio-equipo-real`,
+  `test:auditoria-clientes-real`, `test:preventa-real`,
+  `test:facturas-proveedores-real`,
+  `test:ventas-cliente-facturas-duplicadas-real` — OK, sin tocar (datos
+  de meses/rutas sin duplicados conocidos, o tools no afectadas).
+- `test:ventas-por-ruta-condicion-real` — **FALLÓ primero, actualizado**:
+  el caso real "EMPRESAS 2026-09-04, contado $8.24 en ruta E4" resultó
+  ser EXACTAMENTE los 2 documentos duplicados (`FAE4-000017/018`,
+  $6.18+$2.06) de esa misma venta — confirmado 1:1 contra sus gemelos
+  Odoo ya marcados. El caso de prueba original estaba construido sobre
+  datos ya inflados por el bug; se actualizó a los valores correctos
+  (12266.29 en vez de 12274.53, contado=0, la ruta "E4" ya no aparece)
+  con un comentario explicando el porqué — no es una regresión, es la
+  prueba confirmando que el fix funciona.
+- `test:notas-credito-real` — sigue fallando con el MISMO drift de datos
+  preexistente ya documentado varias veces en este archivo (CD
+  COMISARIATO, -$316,613.12), confirmado NO relacionado a este cambio.
+- `test:backlog-prevendedores-real` — falló en
+  `advertencia_status_desactualizado` (frescura de `ordenes.status`,
+  nada que ver con `facturas` ni con este fix — `backlogPrevendedores.js`
+  no se tocó). No investigado, fuera de alcance de este fix.
+
+### Pendiente
+
+- Los 25 pares en `facturas_duplicados_revision_manual` quedan para
+  revisión manual (probablemente cuentas de cadena/consolidadas, mismo
+  patrón que TIA/El Rosado documentado arriba) — no se marcan solos, a
+  propósito.
+- El 62% de pares cross-sistema (MobilVendor-vs-Odoo) que NO tengan la
+  relación 1-a-1 sigue dependiendo del fix externo del campo
+  `mobilvendor_id` de Odoo (fuera de este repo, lo gestiona el usuario
+  directamente).
+- PR abierto, **sin mergear ni desplegar** — pendiente de autorización
+  aparte.

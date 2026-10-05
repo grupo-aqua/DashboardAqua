@@ -98,6 +98,7 @@ const {
   FILTRO_PREVENTA_SELLER,
   CATEGORIA_PREVENTA,
   FILTRO_CLIENTE_VALIDO,
+  FILTRO_FACTURAS_NO_DUPLICADO,
   CONDICION_PAGO_CLIENTE,
   FUENTE_CONDICION_PAGO_CLIENTE,
   CONDICION_PAGO_FACTURA,
@@ -168,6 +169,7 @@ const SQL_GRUPO = `
     JOIN detalle_documento dd ON dd.documento_code = f.code
     LEFT JOIN clientes c ON c.codigo_cliente = f.customer_code
     WHERE f.status = 2
+      AND ${FILTRO_FACTURAS_NO_DUPLICADO("f")}
       AND (${CASE_GRUPO_FACTURAS}) = $1
       AND ${FILTRO_CLIENTE_VALIDO("f.customer_code")}
       AND f.fecha_creacion >= $2 AND f.fecha_creacion < $3
@@ -261,6 +263,7 @@ const SQL_GRUPO_SIN_DATO_CLIENTES = `
     JOIN detalle_documento dd ON dd.documento_code = f.code
     LEFT JOIN clientes c ON c.codigo_cliente = f.customer_code
     WHERE f.status = 2
+      AND ${FILTRO_FACTURAS_NO_DUPLICADO("f")}
       AND (${CASE_GRUPO_FACTURAS}) = $1
       AND ${FILTRO_CLIENTE_VALIDO("f.customer_code")}
       AND f.fecha_creacion >= $2 AND f.fecha_creacion < $3
@@ -356,6 +359,7 @@ const SQL_RUTA = `
     JOIN detalle_documento dd ON dd.documento_code = f.code
     LEFT JOIN clientes c ON c.codigo_cliente = f.customer_code
     WHERE f.status = 2
+      AND ${FILTRO_FACTURAS_NO_DUPLICADO("f")}
       AND f.seller_code = ANY($1::text[])
       AND f.fecha_creacion >= $2 AND f.fecha_creacion < $3
       AND ($4::text IS NULL OR dd.descripcion_categoria = $4)
@@ -442,6 +446,7 @@ const SQL_RUTA_SIN_DATO_CLIENTES = `
     JOIN detalle_documento dd ON dd.documento_code = f.code
     LEFT JOIN clientes c ON c.codigo_cliente = f.customer_code
     WHERE f.status = 2
+      AND ${FILTRO_FACTURAS_NO_DUPLICADO("f")}
       AND f.seller_code = ANY($1::text[])
       AND f.fecha_creacion >= $2 AND f.fecha_creacion < $3
       AND ($4::text IS NULL OR dd.descripcion_categoria = $4)

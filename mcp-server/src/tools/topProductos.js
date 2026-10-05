@@ -11,6 +11,7 @@ const {
   FILTRO_PREVENTA_SELLER,
   CATEGORIA_PREVENTA,
   FILTRO_CLIENTE_VALIDO,
+  FILTRO_FACTURAS_NO_DUPLICADO,
 } = require("../sql/clasificacion");
 
 const MAX_RANGO_DIAS = 400;
@@ -59,6 +60,7 @@ const SQL_GENERAL = `
     FROM facturas f
     JOIN detalle_documento dd ON dd.documento_code = f.code
     WHERE f.status = 2
+      AND ${FILTRO_FACTURAS_NO_DUPLICADO("f")}
       AND ${FILTRO_CLIENTE_VALIDO("f.customer_code")}
       AND f.fecha_creacion >= $1
       AND f.fecha_creacion <  $2
@@ -124,6 +126,7 @@ const SQL_GRUPO = `
     FROM facturas f
     JOIN detalle_documento dd ON dd.documento_code = f.code
     WHERE f.status = 2
+      AND ${FILTRO_FACTURAS_NO_DUPLICADO("f")}
       AND ${FILTRO_CLIENTE_VALIDO("f.customer_code")}
       AND f.fecha_creacion >= $1
       AND f.fecha_creacion <  $2

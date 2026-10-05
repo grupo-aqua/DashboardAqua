@@ -648,12 +648,45 @@ async function syncDocumento(doc, code, transaction) {
   };
 
   if (type === 1) {
+    const mobilvendorInternalId = doc.id != null ? String(doc.id).trim() || null : null;
+
+    // Reconciliación MobilVendor↔Odoo (ver TODO.md, "Propuesta de diseño
+    // COMPLETA — reconciliación de facturas") — Tier 1, determinístico.
+    // `doc.id` es el id INTERNO de MobilVendor (confirmado en vivo contra su
+    // API — distinto de `code`, que puede cambiar de valor para el MISMO
+    // documento real entre una sincronización y otra). Si ya existe una fila
+    // con este mismo `mobilvendor_internal_id` bajo OTRO `code`, es el mismo
+    // documento visto antes con un código distinto — no crear una fila
+    // nueva: se marca la fila VIEJA como duplicado_de la que se está
+    // escribiendo ahora (la sincronización más reciente gana). No se
+    // reutiliza una fila que ya esté marcada como duplicado de otra
+    // (evita encadenar duplicados). OJO orden: el `UPDATE ... duplicado_de`
+    // va DESPUÉS del upsert de abajo, no antes — `duplicado_de` tiene FK
+    // hacia `facturas(code)`, así que el code nuevo debe existir primero
+    // (confirmado con un caso real: el orden inverso rompe la FK).
+    let filaPrevia = null;
+    if (mobilvendorInternalId) {
+      [filaPrevia] = await sequelize.query(
+        `SELECT code FROM facturas
+         WHERE mobilvendor_internal_id = :internalId
+           AND code <> :code
+           AND duplicado_de IS NULL
+         LIMIT 1`,
+        {
+          replacements: { internalId: mobilvendorInternalId, code },
+          transaction,
+          type: sequelize.QueryTypes.SELECT,
+        }
+      );
+    }
+
     await Factura.upsert(
       {
         ...basePayload,
         origen_sistema      : "MOBILVENDOR",
         company_id         : COMPANY_ID,
-        descripcion_company : COMPANY_DESC, 
+        descripcion_company : COMPANY_DESC,
+        mobilvendor_internal_id: mobilvendorInternalId,
         customer_address_code:
           doc.customer_address_code   ||
           doc.customer_address_code_2 ||
@@ -665,6 +698,18 @@ async function syncDocumento(doc, code, transaction) {
       },
       { transaction }
     );
+
+    if (filaPrevia) {
+      await sequelize.query(
+        `UPDATE facturas SET duplicado_de = :codeNuevo WHERE code = :codeViejo`,
+        {
+          replacements: { codeNuevo: code, codeViejo: filaPrevia.code },
+          transaction,
+          type: sequelize.QueryTypes.UPDATE,
+        }
+      );
+    }
+
     return "factura";
   }
 
