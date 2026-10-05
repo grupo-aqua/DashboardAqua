@@ -100,6 +100,11 @@ app.use("/api/COTTSA", require("./routes/rutasCotsa/cotsaRoutes"));
 app.use("/api/consolidado", require("./routes/rutasConsolidado/consolidadoRoutes"));
 
 // ======================================================
+//  VENTAS POR RUTA (consumido por icl-backend — cuadre, liquidación)
+// ======================================================
+app.use("/api/ventas-por-ruta", require("./routes/rutasVentasPorRuta/ventasPorRutaRoutes"));
+
+// ======================================================
 //  CAFÉ — IIBC S.A.
 // ======================================================
 app.use("/api/cafe", require("./routes/rutasCafe/cafeRoutes"));
