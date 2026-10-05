@@ -6330,5 +6330,102 @@ peso que no se haya descubierto todavía, o aclara qué es
 3. Validar `status=5/waybill_status=3` como "entregado" y la heurística
    de "reagendado" contra 2-3 casos reales conocidos (mismo patrón de
    verificación que ya se usó para el status de PREVENTA con Alberto).
-4. Decisión del usuario: ¿seguir sin el peso (Alberto mantiene su lista
-   manual para eso) o pausar hasta que aparezca una fuente de peso?
+4. ~~Decisión del usuario: ¿seguir sin el peso...?~~ → **resuelto, ver
+   abajo** — el usuario encontró dónde vive el peso real.
+
+## ✅ Peso resuelto — `article_units` confirmado en vivo, los 3 entregables bloqueados pasan a FACTIBLES (2026-10-05)
+
+El usuario encontró la pista correcta en la propia UI de MobilVendor:
+`Articles → [código] → pestaña "Units"` — una SUB-TABLA de unidades por
+artículo (un artículo puede vender/comprarse en más de una unidad, cada
+una con su propio peso), no un campo plano del artículo. Verificación
+matemática que trajo como evidencia: artículo 39 (PACK x15 625ML AQUA
+PREMIUM, el mismo de la guía de ejemplo `GUD1112-000214`), unidad "UNI"
+con Net weight=9.375; la guía reportaba 15 unidades con Net weight
+total 140.63 ≈ 9.375×15=140.625.
+
+### 1) Endpoint encontrado — en el primer intento, mismo patrón genérico ya conocido
+
+`action:"get", schema:"article_units"` — exactamente la sub-tabla
+descrita: `article_code, unit_code, barcode, net_weight, brut_weight,
+volume, factor, type, sale, purchase`. Confirmado en vivo:
+
+```
+article_code=39, unit_code=1   (Unidades, factor=15) -> net_weight=0.000
+article_code=39, unit_code=UNI (UNIDAD,   factor=1)  -> net_weight=9.375  ← coincide EXACTO con el dato del usuario
+```
+
+También existe `schema:"articles"` (82 registros) — el artículo cabecera,
+que replica el `net_weight` de su unidad de venta (`sale='1'`) a nivel
+de artículo (mismo valor, 9.375 para el 39) — y `schema:"units"` (31
+registros, catálogo de nombres de unidad). Los 3 son de una sola
+página cada uno (sin paginar) — catálogo chico, consulta trivial.
+
+### 2) Escala y consistencia — confirmado con datos reales, no solo el ejemplo
+
+- **A nivel de catálogo completo** (82 artículos / 70 filas
+  article_units): solo 14 (17-20%) tienen `net_weight>0` — a primera
+  vista parece incompleto.
+- **Pero a nivel de lo que REALMENTE se despacha** (9 códigos de
+  artículo distintos vistos en 4,820 líneas reales de `getWaybills`,
+  ago-sep 2026): **9 de 9 (100%) tienen `net_weight>0`** en
+  `article_units`. El 80%-83% sin peso del catálogo completo son
+  artículos que no se despachan de verdad (ej. "001 EXHIBIDOR DE 5",
+  0 peso, es un exhibidor/accesorio, no un producto que se entrega) —
+  no es un hueco de dato real, es que esos artículos no necesitan peso.
+- **Sin ambigüedad de unidad**: ningún artículo tiene más de 1 fila con
+  `sale='1'` (0 de 60 artículos con unidad de venta definida) — la
+  elección "la unidad con `sale='1'`" es siempre única, sin casos
+  raros que resolver a mano.
+- `article_code` en `article_units` es el MISMO código que
+  `detalle.article_code`/`productos.codigo_producto` ya usa el sync de
+  MobilVendor hoy (confirmado en `sincronizacionService.js`) — no hace
+  falta ninguna traducción de código.
+
+### 3) Implicación de diseño — más simple de lo que se había estimado
+
+El peso es un atributo ESTÁTICO del catálogo (como precio o
+categoría), no algo que cambie por guía/pedido — así que NO hace falta
+una columna de peso por línea en `detalle_documento` ni en los nuevos
+`waybills_detalle`: alcanza con poblar **`productos.peso`** (columna
+que YA EXISTE, ya la usa el sync de Odoo, solo el sync de MobilVendor
+nunca la llenaba) desde `article_units` (fila con `sale='1'` por
+`article_code`), y computar el peso de cualquier línea/guía/pedido como
+`cantidad × productos.peso` en cada tool — sin tabla ni columna nueva
+para esto específicamente.
+
+### Re-evaluación de los 3 entregables bloqueados
+
+- **`catalogoProductos`**: ✅ **totalmente factible**. Antes era "todo
+  excepto peso"; ahora expone `productos.peso` directo, ya poblado.
+- **`detallePedidos`**: ✅ **totalmente factible**. Peso de línea =
+  `detalle_documento.cantidad × productos.peso` (join simple, ya
+  disponible con el fix de abajo). `CodigoFacturacion` sigue como
+  única pregunta abierta (no relacionada al peso).
+- **Capacidad de carga**: ✅ **totalmente factible**, confirmado tal
+  cual se propuso — `pedidosEnGuia` ya puede dar el peso total real de
+  la guía (`Σ cantidad×peso` de sus líneas), el gerente manda
+  `capacidad_maxima_kg` como parámetro al pedir el reporte, sin guardar
+  nada nuevo en el sistema.
+
+### Desglose del estimado por tarea concreta (pedido explícito del usuario)
+
+| Tarea | Qué toma el tiempo | Estimado |
+|---|---|---|
+| **1. Sync de `article_units`/`articles` → `productos.peso`** (NUEVO, no estaba en el estimado original) | Función de sync chica y aislada: traer `article_units` (1 página, 70 filas), filtrar `sale='1'` por `article_code`, `UPDATE productos SET peso WHERE codigo_producto=article_code`. Diseño trivial (sin ambigüedad de unidad, confirmado arriba) — la mayoría del tiempo es validación: confirmar que los 9+ códigos realmente despachados quedan con el peso correcto, y decidir si corre 1x/día o solo bajo demanda (el peso casi no cambia). | 0.5 día |
+| **2. Sync de `waybills`/`getWaybills`** (cabecera+detalle, tabla propia, cron propio) | Diseño de 2 tablas nuevas (`waybills_cabecera`/`waybills_detalle`) — mecánico, mismo patrón que `routes`/`vigilo_*`. La mayor parte del tiempo NO es la tabla — es: (a) confirmar si el filtro de fecha de `getWaybills` realmente acota algo (en la investigación se vio un caso con `dispatch_date` de **noviembre 2024** devuelto al filtrar por sep-oct 2026 — sugiere que puede necesitar barrido completo paginado en vez de incremental por rango, hay que confirmarlo con más casos antes de diseñar el cron), y (b) escribir + probar el upsert paginado contra el volumen real (miles de guías). | 1-1.5 días |
+| **3. Resolver el join pedido↔`invoice_code`** (agregar `mobilvendor_internal_id` a `ordenes`, mismo patrón ya construido para `facturas` en el PR #13) | La columna + captura en el upsert es mecánica (copiar el patrón ya probado, ~1-2 horas). Lo que realmente toma tiempo: `invoice_code` viene en 2 formatos distintos en la muestra (a veces un id crudo tipo "123"/"1234", a veces ya formateado tipo "PD000001") — hay que caracterizar empíricamente CUÁNDO aparece cada formato (¿por época, por tipo de pedido, por algo más?) antes de poder escribir una sola lógica de join confiable. Es investigación, no código. | 0.5-1 día |
+| **4. `pedidosEnGuia`** (tool + parámetros ruta/fechas + peso total + `capacidad_maxima_kg` opcional) | Diseño de query (join waybills_cabecera+detalle+ordenes vía el fix del punto 3), formato de salida (lista de IDs de pedido, desglose), más la resta simple `peso_total/capacidad_maxima_kg` si se pide. Directo una vez que 1-3 estén listos — no agrega complejidad propia relevante. | 0.5 día |
+| **5. `detallePedidos`** (tool, una fila por línea) | Query de detalle (reutiliza los joins del punto 4, agrega el peso por línea ya resuelto). El tiempo real acá es la pregunta de `CodigoFacturacion` sin resolver — si Alberto tarda en dar el ejemplo, esta tool queda incompleta en ese único campo hasta entonces (el resto se construye igual). | 0.5-1 día |
+| **6. `estadoPedidosDia` + snapshot diario** (tabla nueva `pedidos_snapshot_diario`, paso de cron a las 23:59, heurística de reagendado) | Lo mecánico (tabla + paso de cron que graba status/waybill_status/fecha_entrega una vez al día) es rápido, ~3-4h. Lo que toma tiempo real: diseñar y PROBAR la heurística de "reagendado" (comparar snapshot día N vs N+1, inferir cuándo una fecha_entrega se corrió sin que el pedido cerrara) contra 2-3 casos reales conocidos — sin eso validado, se entrega una heurística sin confirmar, que es justo el tipo de cosa que ya generó bugs reales antes en esta sesión (ej. RUTA_COMBINADA). | 1-1.5 días |
+| **7. `catalogoProductos`** (tool, expone `productos` tal cual, peso incluido) | La más simple de las 4 — leer y formatear lo que ya está en `productos`, sin joins nuevos. | 0.25 día |
+| **8. Tests `-real.test.js` + validación en vivo de las 4** (mismo estándar que el resto del MCP — comparar contra SQL directo/datos reales conocidos, no solo `node --check`) | Un test por tool como mínimo, más 1-2 casos cruzados (ej. `pedidosEnGuia` de una guía conocida vs. `detallePedidos` de la misma guía debe cuadrar). Dado el patrón de esta sesión (2 bugs reales encontrados SOLO al validar en vivo, no con revisión de código, en el fix de reconciliación de facturas), este paso no se recorta. | 1 día |
+| **Total** | | **~5.75-7.25 días** |
+
+Sube un poco respecto al estimado anterior (~5-6.5 días) — no porque
+algo se puso más difícil, sino porque el peso pasó de "excluido" a
+"incluido" en 3 entregables (antes no sumaba tiempo porque no se iba a
+construir). Sigue pendiente, sin relación al peso: la aclaración de
+`CodigoFacturacion` (punto 5) y la validación de la heurística de
+reagendado con Alberto (punto 6) — ninguna de las dos bloquea empezar,
+ambas pueden resolverse en paralelo mientras se construye el resto.
