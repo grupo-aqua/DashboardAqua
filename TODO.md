@@ -6046,3 +6046,289 @@ facturas f` en cada archivo (ninguno quedó sin el filtro).
   directamente).
 - PR abierto, **sin mergear ni desplegar** — pendiente de autorización
   aparte.
+
+## 📋 Factibilidad — 4 tools nuevas para pedidos/entregas en "rutas DESCARTABLE" (2026-10-05, SOLO INVESTIGACIÓN, sin implementar)
+
+Pedido: evaluar factibilidad de `pedidosEnGuia`, `detallePedidos`,
+`estadoPedidosDia`, `catalogoProductos` antes de construir nada, usando
+como contexto el análisis de una guía real impresa (`GUD1112-000214`,
+ruta "D1112", 05-oct-2026, peso neto total $1,211.63 en el reporte).
+Todo lo de abajo viene de probar en vivo contra la API real de
+MobilVendor (login + `getInvoices`/`get(schema)`/`getWaybills`, mismo
+patrón de investigación de toda la sesión) y contra Postgres/Odoo —
+nada implementado todavía.
+
+### 0) Aclaración previa, necesaria para todo lo demás: qué es "D1112" y qué es "DESCARTABLE" acá
+
+**"DESCARTABLE" NO es una ruta — es la categoría de producto
+`codigo_categoria='7'`**, exactamente el mismo concepto que ya usa
+`clasificacion.js`/`detalle_documento.codigo_categoria` en el resto del
+MCP. Confirmado también del lado de MobilVendor: cada línea de detalle
+de la entidad `waybills`/`getWaybills` trae su propio
+`category_code`/`category_description`, y en una muestra de 2,000
+waybills / 9,640 líneas (ago-sep 2026) **el 100% es
+`category_code='7'` (DESCARTABLE)** — la entidad completa de guías
+(`waybills`) parece estar dedicada exclusivamente a despacho de
+descartable, no es necesario ningún filtro adicional de ruta/usuario
+para acotarla.
+
+**"D1112" es un código de DESPACHADOR (rol `user_role_code =
+'DESPACHADOR D'`), no un `seller_code` de pedido ni un tag de Vigilo.**
+Confirmado con datos reales: los `user_code` bajo ese rol son D210, D56,
+D9, D314, D1213, etc. — la misma familia de códigos D1-D1213 ya
+documentada en la investigación de `backlogPrevendedores`
+("rutas D", más arriba en este archivo) pero vista ahora del lado
+correcto: **es el despachador/camión que CONSOLIDA pedidos de varios
+prevendedores (`ordenes.seller_code` T5/T6/TV2/etc., el mismo universo
+que ya cubre `backlogPrevendedores`) en una sola guía física de
+entrega.** Por eso no calza con los tags de Vigilo (T1-T11/E1-E10/D8/
+DR1) — son namespaces distintos: Vigilo mapea VEHÍCULOS de la flota
+GPS, esto mapea DESPACHADORES/camiones del módulo de guías de
+MobilVendor, sistemas separados sin relación 1 a 1 conocida. Existen
+otros roles hermanos (`DESPACHADOR E`, `DESPACHADOR C`, `DESPACHADOR`
+plano) con sus propias familias de `user_code` (T8.1, T1.1, T4, T13.1,
+etc.) — mismo mecanismo, aparentemente otras zonas/turnos.
+
+**Criterio estable recomendado** (sin prefijos a mano, tal como se
+pidió): no filtrar por `user_code ILIKE 'D%'` — usar
+`category_code='7'` a nivel de línea (ya establecido en todo el resto
+del código) y/o `user_role_code = 'DESPACHADOR D'` cuando haga falta
+distinguir esta familia específica de las otras 3 — ambos vienen
+directo de la API, no son inventados.
+
+### 1) `pedidosEnGuia` — FACTIBLE, con 1 pieza nueva de sync
+
+**La entidad correcta es `waybills`/`getWaybills` (la propuesta del
+usuario era acertada) — NO `ordenes.waybill_status`.** Confirmado:
+`ordenes.waybill_status` tiene protección `COALESCE` (nunca se
+re-sincroniza tras la primera captura, ver hallazgo ya documentado de
+"Rutas D"/backlogPrevendedores arriba) y, para el canal T*/TV*
+completo, solo 6,277 de ~95,000 órdenes (2026) tienen algo distinto de
+vacío — la entidad `waybills` en cambio es rica, dedicada, independiente
+de ese problema de staleness.
+
+Dos acciones disponibles para la MISMA entidad (descubiertas en la
+investigación previa de "Rutas D", nunca sincronizadas):
+- `action:"get", schema:"waybills"` — paginado genérico (mismo patrón
+  que ya usa `syncRouteDetailsService.js` para `routes`), 1 fila por
+  guía: `code` (`GU<despachador>-NNNNNN`), `plate_number`, `user_code`
+  (despachador), `status` (0=Shipping/1,320 muestreadas, 3=Terminated/
+  680 muestreadas — confirma 1:1 el significado ya documentado para
+  `waybill_status`), `dispatch_start_date`/`dispatch_end_date`
+  (epoch), `amount`, `storage_code`, `office_code`.
+- `action:"getWaybills"` — misma entidad, respuesta más rica
+  (`headers`+`details`+`details_by_invoices`), trae además
+  `user_role_code`, `vehicle_code`/`vehicle_description`,
+  `office_name`/`office_ruc`/`storage_address`.
+
+**Campos pedidos por el usuario, uno por uno:**
+- Número de guía, fecha, estado: ✅ directo (`code`, `dispatch_start_date`/`dispatch_end_date`, `status`).
+- Chofer/vehículo: ⚠️ parcial — `vehicle_code`/`vehicle_description`
+  vienen NULL en el 100% de la muestra (2,000 guías); lo único poblado
+  de forma confiable es `user_code`/`user_name` (el despachador, no
+  necesariamente el chofer físico). Puede que no haya un chofer
+  distinto capturado en este sistema — pendiente de confirmar con
+  Alberto si el reporte impreso trae ese dato de otra fuente.
+- Cantidad de pedidos / listado de IDs de pedido asignados: ⚠️ ver
+  punto siguiente — la guía SÍ referencia sus pedidos (`invoice_code`
+  en `details_by_invoices`), pero el formato del valor es
+  **inconsistente** en la muestra (a veces un id numérico crudo tipo
+  MobilVendor — "123", "1234" — a veces un código ya formateado tipo
+  "PD000001"). Need más investigación empírica (no bloqueante para el
+  estimado, sí para el detalle de implementación) para resolver esa
+  referencia 1:1 contra `ordenes.code` — lo más probable, dado el
+  patrón ya usado en `facturas.mobilvendor_internal_id` (agregado esta
+  semana, PR #13), es que haga falta agregar el mismo campo a
+  `ordenes` (captura ya trivial, mismo mecanismo, la API ya expone
+  `doc.id` en el objeto de cada pedido) y unir por ahí en vez de por
+  `code`.
+- Peso neto total de la guía: ❌ **no disponible de forma confiable**
+  — ver hallazgo de peso abajo (aplica igual acá: `net_weight`/
+  `brut_weight` existen como campo pero dan 0.000 en el 100% de 9,640
+  líneas muestreadas).
+
+**Requiere sync nuevo** (tabla propia, igual patrón que `vigilo_*` o
+`routes`/`route_details` — paginado genérico, no toca `ordenes` ni
+`facturas`): `waybills_cabecera` + `waybills_detalle`, alimentadas por
+`action:"getWaybills"` (la variante rica, trae todo en una sola
+llamada). Candidato natural para un cron propio (igual patrón que
+Vigilo, 1x al día) dado que esta API no parece tener una ventana de
+fechas que realmente filtre (ver hallazgo del punto 2) — probablemente
+necesite barrido completo paginado, no incremental por rango, al menos
+en una primera versión.
+
+### 2) `detallePedidos` — FACTIBLE para todo excepto peso, con 1 pregunta abierta (CodigoFacturacion)
+
+Todo lo demás pedido (ID de pedido, guía, ruta, cliente, dirección,
+producto, UM, cantidad, precio, valor) sale directo de los mismos
+`details`/`details_by_invoices` de `getWaybills` — mismos campos ya
+confirmados arriba (`article_code`, `article_description`, `unit_code`,
+`quantity`, `price`, `subtotal`/`total`, `category_code`).
+
+**Peso neto de línea — confirmado NO disponible, en 3 fuentes
+independientes, no es un hueco de sync:**
+1. `detalle_documento` (nuestra tabla) no tiene columna de peso.
+2. `productos.peso` SÍ existe como columna (ya la usa el sync de Odoo,
+   `peso: toNumber(p.weight)`) pero está en 0 para el 100% de 146
+   productos — confirmado en vivo contra Odoo directo (no contra
+   nuestra copia): de 280 productos `sale_ok=true`, **1 solo** tiene
+   `weight>0` (y es "Tips", 0.01kg — no un producto real de agua). Odoo
+   mismo no tiene configurado el peso de los productos reales.
+3. `getWaybills`'s `details`/`details_by_invoices` SÍ traen
+   `net_weight`/`brut_weight` por línea — pero en **0 de 9,640 líneas
+   muestreadas (ago-sep 2026)** tienen un valor distinto de 0.000.
+
+**Conclusión**: el "Net weight" que aparece en el reporte impreso de
+Alberto no sale de ningún endpoint JSON al que tengamos acceso hoy —
+casi seguro se calcula dentro del motor de reportes propio de
+MobilVendor (mismo patrón ya encontrado con `action:"getReports"` en la
+investigación de "Rutas D": son plantillas FastReport, con lógica
+propia, no datos planos expuestos por esta API). **No es implementable
+con el acceso actual** — queda igual que anticipó el usuario: Alberto
+sigue con su lista manual de pesos para esto específicamente, el resto
+de `detallePedidos` sí se construye.
+
+**Pregunta abierta, bloqueante solo para el campo `CodigoFacturacion`**:
+no se encontró ningún campo con ese nombre ni equivalente obvio en
+`direcciones_clientes` (19 columnas, ninguna de facturación) ni en los
+campos de dirección de `getInvoices`/`getWaybills` ya inspeccionados
+(`customer_address_code`, `customer_identity`/`customer_identity_type`
+son los candidatos más cercanos, pero ninguno se llama ni se comporta
+obviamente como "CodigoFacturacion"). Probablemente es una columna
+propia del reporte impreso de MobilVendor (no necesariamente 1:1 con un
+campo de la API JSON) — se necesita un ejemplo concreto (captura del
+reporte o el valor real de un cliente conocido) para identificar a qué
+campo corresponde antes de prometerlo en el diseño final.
+
+### 3) `estadoPedidosDia` — FACTIBLE, con el mapeo de `status` CORREGIDO (no el que se asumía) + diseño de snapshot diario
+
+**El mapeo de status que se traía ("0=Borrador, 2=Confirmado,
+10=Completado oficiales") NO coincide con los datos reales del canal
+T*/TV* ("rutas DESCARTABLE"/rutas D) — verificado contra la tabla
+completa, no una muestra:**
+
+```
+ordenes (type=2, MOBILVENDOR), TODO el histórico:
+status=2  : 188,841   (ningún status=0 existe — 0 filas en TODA la tabla)
+status=3  :   2,770
+status=4  :  11,900
+status=5  : 120,858
+status=10 :       2   (ruido — 1 ruta rural R2, 1 con seller_code literal "10", no es un estado "oficial" a escala)
+```
+
+**El hallazgo real, cruzando `status` con `waybill_status` (2026,
+canal T*/TV*)**:
+```
+status=2            : 86,899 — SIEMPRE sin guía (pendiente real, nunca avanzó)
+status=3            :    470 — sin guía en el 99.6% de los casos
+status=4            :    759 — con waybill_status=0 (Shipping) en el 99.7%
+status=5, wb=0       :    645 — "despachado, en camino"
+status=5, wb=3       :  4,875 — "despachado, entregado" (el 88% de los status=5)
+status=5, sin guía    :     16
+```
+**`status=5` es el único valor con volumen real y con señal de entrega
+granular vía `waybill_status` (0=en camino, 3=entregado)** — coincide
+con el mismo patrón ya documentado para PREVENTA ("status=5 =
+facturado/cerrado administrativamente", no necesariamente entregado
+físico — la granularidad real vive en `waybill_status`, no en
+`status`). **`status=3`/`4` siguen sin una interpretación clara
+confirmada** (igual que ya sabía el usuario) — volumen bajo, sin señal
+de guía consistente; no bloquea el diseño (se exponen tal cual, sin
+interpretar, mismo patrón ya usado en `backlogPrevendedores.por_status`).
+
+**"Entregado" = `status=5 AND waybill_status='3'`. "Reagendado"**: no
+se encontró NINGÚN campo explícito de reprogramación (ni en el objeto
+de la orden vía `getInvoices`, ni en `waybills`/`getWaybills`) — no hay
+un flag `reprogramado`/`fecha_original` en ningún lado de la API
+explorada. Confirma lo que ya se sospechaba: hay que INFERIRLO
+comparando snapshots, no leerlo directo.
+
+**Hora real de entrega y zona horaria**: `dispatch_end_date` (epoch
+Unix, igual que `create_date`/`dispatch_date` ya conocidos) es el
+candidato — mismo manejo de zona horaria ya establecido en todo el
+sync (`parseUnixToEcuador`, resta 5h). Caveat encontrado: en la
+muestra, `dispatch_start_date` y `dispatch_end_date` vienen **iguales**
+en varios casos (ej. la guía D210 de ejemplo) — sugiere que a veces es
+una VENTANA PLANIFICADA, no el momento real de cierre — necesita
+validación con un caso real conocido (mismo patrón de verificación ya
+usado para waybill_status con Alberto) antes de prometerlo como "hora
+real de entrega" sin matices.
+
+**Snapshot diario vs. historial de cambios — recomendación: snapshot,
+por 2 razones concretas:**
+1. Encaja con la arquitectura ya existente (cron 2x/día, nada de
+   event-sourcing en todo el sistema) — un historial de cambios
+   requeriría un mecanismo nuevo de captura de eventos que no existe
+   en ningún otro lado del código.
+2. MobilVendor expone ESTADO (snapshot), no eventos — no hay ningún
+   endpoint de "historial"/"log de cambios" descubierto en ninguna de
+   las investigaciones de esta sesión ni la anterior (de "Rutas D").
+   Reconstruir un historial de cambios sin que la fuente lo exponga
+   significaría inferir transiciones comparando snapshots igual — el
+   historial de cambios NO es más barato, es el mismo trabajo con un
+   paso extra.
+
+Diseño propuesto: tabla `pedidos_snapshot_diario` (código de pedido,
+fecha del snapshot, status, waybill_status, fecha_entrega, ruta —
+PK compuesta código+fecha), poblada por un paso nuevo del cron a las
+23:59 (horario Ecuador) ANTES de que la ventana de 10 días se mueva —
+resuelve exactamente el problema de fondo ya identificado (no se puede
+reconstruir el cierre de un día pasado) y, comparando snapshot(día N)
+vs. snapshot(día N+1) para el MISMO código, permite inferir
+"reagendado" cuando `fecha_entrega` cambia a una fecha posterior sin
+que el pedido haya cerrado (`waybill_status` nunca llegó a 3) — una
+heurística razonable, no una lectura directa de un campo que no existe.
+
+### 4) `catalogoProductos` — FACTIBLE excepto peso (mismo hallazgo que el punto 2)
+
+Código, descripción, categoría, UM: ✅ ya sincronizado hoy
+(`productos`: `codigo_producto`, `nombre_producto`, `codigo_categoria`,
+`unidad_medida`). Peso por unidad: ❌ mismo hallazgo que arriba — 0%
+poblado en las 3 fuentes probadas (nuestra copia, Odoo en vivo,
+`getWaybills` en vivo). Esta tool es la más simple de las 4 — básicamente
+exponer lo que ya existe en `productos`, sin sync nuevo.
+
+### Capacidad de carga — confirmado, no hace falta nada más
+
+Con `pedidosEnGuia` dando el peso... **excepto que el peso no está
+disponible** (ver punto 1/2) — así que la respuesta cambia: **si se
+resuelve el peso en algún momento** (ej. Alberto consigue que
+MobilVendor libere el campo, o aparece en otro endpoint no descubierto
+todavía), sí — combinar el total de `pedidosEnGuia` con un parámetro
+`capacidad_maxima_kg` que mande el gerente al pedir el reporte alcanza,
+sin guardar nada nuevo en el sistema (ni tabla ni columna). **Hoy, sin
+peso disponible, esta funcionalidad queda bloqueada por el mismo hueco
+de datos** — no es un problema de diseño, es que no hay con qué
+calcular el peso todavía.
+
+### Estimado de tiempo
+
+| Pieza | Factibilidad | Esfuerzo estimado |
+|---|---|---|
+| Sync nuevo de `waybills`/`getWaybills` (cabecera + detalle, tabla propia, cron 1x/día) | Alta — API ya probada en vivo, mismo patrón que `routes`/`vigilo_*` | 1-1.5 días |
+| Resolver el join pedido↔`invoice_code` (agregar `mobilvendor_internal_id` a `ordenes`, mismo patrón que `facturas`) | Media — mecanismo ya existe, el formato inconsistente de `invoice_code` necesita más investigación empírica | 0.5-1 día |
+| `pedidosEnGuia` | Alta (sin peso de guía) | 0.5 día |
+| `detallePedidos` | Alta (sin peso de línea); `CodigoFacturacion` pendiente de aclarar | 0.5-1 día |
+| `estadoPedidosDia` + snapshot diario (tabla + paso de cron 23:59) | Media — el snapshot es sencillo, la heurística de "reagendado" necesita validarse con casos reales antes de confiar en ella | 1-1.5 días |
+| `catalogoProductos` | Alta (sin peso) | 0.25 día |
+| Tests `-real.test.js` + validación en vivo de las 4 (mismo estándar que el resto del MCP) | — | 1 día |
+| **Total** | | **~5-6.5 días** |
+
+No incluye: resolver el peso neto (bloqueado por falta de dato en
+origen, no es trabajo de ingeniería) ni `CodigoFacturacion` (necesita
+aclaración antes de poder estimarlo). Si Alberto confirma una fuente de
+peso que no se haya descubierto todavía, o aclara qué es
+`CodigoFacturacion`, se ajusta el estimado.
+
+### Pendiente antes de implementar
+
+1. Confirmar con Alberto el mapeo exacto `invoice_code` → `ordenes.code`
+   (formato inconsistente encontrado, necesita una pasada empírica más
+   dirigida).
+2. Un ejemplo concreto de qué campo es `CodigoFacturacion` en el
+   reporte real.
+3. Validar `status=5/waybill_status=3` como "entregado" y la heurística
+   de "reagendado" contra 2-3 casos reales conocidos (mismo patrón de
+   verificación que ya se usó para el status de PREVENTA con Alberto).
+4. Decisión del usuario: ¿seguir sin el peso (Alberto mantiene su lista
+   manual para eso) o pausar hasta que aparezca una fuente de peso?
