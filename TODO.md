@@ -6429,3 +6429,91 @@ construir). Sigue pendiente, sin relación al peso: la aclaración de
 `CodigoFacturacion` (punto 5) y la validación de la heurística de
 reagendado con Alberto (punto 6) — ninguna de las dos bloquea empezar,
 ambas pueden resolverse en paralelo mientras se construye el resto.
+
+## 💰 Estimado reorganizado por entregable (no por tarea técnica), para priorizar (2026-10-05)
+
+Pedido explícito: Alberto necesita decidir qué construir primero, así
+que el estimado por tarea técnica compartida (sync de peso, sync de
+waybills, join de `invoice_code`...) no sirve directo para eso — hace
+falta el costo de punta a punta de cada entregable, asignando el costo
+de cada pieza compartida a quien realmente la necesita.
+
+**Aviso importante antes de los 3 números**: las piezas compartidas NO
+se reparten parejo entre los 3 paquetes — `pedidosEnGuia` y
+`detallePedidos` necesitan EXACTAMENTE la misma infraestructura (sync
+de `waybills` + el join de `invoice_code`), porque los dos leen de la
+misma fuente (`getWaybills`), solo a distinto nivel de detalle
+(cabecera vs. línea). Si se construye `pedidosEnGuia` primero, el costo
+de infraestructura de `detallePedidos` después es mucho menor (ya está
+pagado). Por eso cada número de abajo trae 2 escenarios donde aplica:
+construido "solo" (sin nada previo) vs. "después de" otro paquete ya
+construido.
+
+### 1) `pedidosEnGuia` + capacidad de carga — de punta a punta
+
+Necesita: sync de `waybills`/`getWaybills` (cabecera+detalle, tabla
+propia) + el join `invoice_code`→`ordenes.code` (para el listado de
+pedidos por guía) + el sync de peso (`article_units`→`productos.peso`,
+para el peso total de la guía que alimenta la capacidad de carga) + la
+tool en sí (incluye el parámetro `capacidad_maxima_kg` opcional) + tests.
+
+**Total: 3-4 días**, sin depender de nada construido antes (es, de los
+3, el que tiene más sentido construir PRIMERO — su infraestructura es
+la que después abarata a `detallePedidos`).
+
+### 2) `estadoPedidosDia` + snapshot diario — de punta a punta
+
+**Es independiente de (1) para su mecanismo central** — el snapshot
+diario resuelve el problema de fondo (no se puede reconstruir el
+cierre de un día pasado por el `DIAS_RETRO=10`) usando `ordenes.status`/
+`waybill_status`/`fecha_entrega` TAL CUAL existen hoy en la tabla
+`ordenes`, sin necesitar el sync nuevo de `waybills`.
+
+**Matiz real que sí importa para la decisión**: `ordenes.waybill_status`
+ya se documentó como "casi congelado" (protegido con `COALESCE`, nunca
+se re-sincroniza) — así que la señal de "entregado" que usa esta tool,
+construida de forma independiente, hereda esa misma limitación ya
+conocida (no es nueva, no la causa esta tool). Si más adelante se
+quiere una señal de entregado más confiable, se resuelve reutilizando
+el sync de `waybills` de (1) — pero esa mejora es opcional, no
+bloquea construir esta tool ahora con el dato tal cual está.
+
+**Total: 1.5-2 días**, construida sola, con la limitación de
+`waybill_status` ya conocida y aceptada (igual que el resto del MCP
+documenta sus limitaciones en vez de ocultarlas). No cambia si (1) ya
+existe o no — no comparte infraestructura con (1) en su versión base.
+
+### 3) `detallePedidos` + `catalogoProductos` — de punta a punta
+
+`catalogoProductos` es simple y casi independiente (solo necesita el
+sync de peso). `detallePedidos` SÍ comparte la infraestructura pesada
+de (1) — es la misma fuente (`getWaybills`) a nivel de línea en vez de
+cabecera.
+
+- **Si se construye DESPUÉS de (1)** (`pedidosEnGuia` ya existe, su
+  sync de `waybills`+join+peso ya están pagados): `detallePedidos` se
+  reduce a su propia query+tool (reutiliza todo lo demás) +
+  `catalogoProductos` (ya trivial, el sync de peso ya existe también).
+  **Total incremental: 1.5-2 días.**
+- **Si se construye SOLO, sin (1)**: hay que pagar de nuevo el sync de
+  `waybills` + el join `invoice_code` + el sync de peso — básicamente
+  la misma infraestructura de (1), solo que financiada por este paquete
+  en vez de aquel. **Total: 3.75-5.3 días.**
+
+(`CodigoFacturacion` sigue sin resolver en cualquiera de los 2
+escenarios — no cambia el costo, es una pregunta aparte pendiente de
+un ejemplo concreto.)
+
+### Resumen para decidir
+
+| Orden de construcción | (1) pedidosEnGuia+capacidad | (2) estadoPedidosDia+snapshot | (3) detallePedidos+catalogoProductos | Total |
+|---|---|---|---|---|
+| (1) → (3) → (2), o cualquier orden con (1) primero | 3-4d | 1.5-2d | 1.5-2d | **6-8d** |
+| (3) solo, nunca se construye (1) | — | — | 3.75-5.3d | — |
+| (2) solo, primero | — | 1.5-2d | — | — |
+
+Si Alberto va a querer los 3 entregables tarde o temprano, construir
+**(1) primero** es estrictamente más barato en total que cualquier otro
+orden (ahorra ~2-3 días de infraestructura duplicada en (3)). Si solo
+le interesa (2) por ahora, es completamente independiente — se puede
+construir aparte sin comprometerse a nada de (1)/(3) todavía.
