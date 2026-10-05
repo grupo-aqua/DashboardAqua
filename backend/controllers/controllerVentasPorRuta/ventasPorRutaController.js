@@ -75,14 +75,21 @@ const obtenerVentasPorRuta = async (req, res) => {
     // GROUPING SETS: (categoria) da por_categoria igual que antes, sin tocar
     // ese cálculo; (condicion_pago) da el desglose de Liquidación;
     // (sub_producto_botellon) da el desglose nuevo para el cuadre de
-    // líquido/envase; () da el total general — las 4 vistas salen de la
-    // MISMA suma de dd.total, así que total_dolares_general siempre
-    // reconcilia exacto contra los 3 desgloses.
+    // líquido/envase; (es_regalia) reemplaza la detección vieja y rota de
+    // "categoria = REGALIA" (esa categoría NUNCA existió en los datos
+    // reales, confirmado 17-sep-2026 Y de nuevo 05-oct-2026 — cuadreService
+    // siempre calculó regalia=0 en cada cuadre hasta ahora). Una regalía es
+    // cualquier línea con cantidad>0 pero total=0 sobre un producto normal
+    // (confirmado contra datos reales: 6478 u. de BOTELLÓN regaladas en los
+    // últimos 30 días, no 0 como asumía el código viejo); () da el total
+    // general — las 5 vistas salen de la MISMA suma de dd.total, así que
+    // total_dolares_general siempre reconcilia exacto contra los 4 desgloses.
     const sql = `
       SELECT
         categoria,
         condicion_pago,
         sub_producto_botellon,
+        es_regalia,
         SUM(unidades) AS unidades,
         SUM(dolares)  AS dolares,
         COUNT(DISTINCT doc_code) AS documentos
@@ -91,6 +98,7 @@ const obtenerVentasPorRuta = async (req, res) => {
           COALESCE(dd.descripcion_categoria, 'SIN CATEGORÍA') AS categoria,
           ${CONDICION_PAGO_CASE} AS condicion_pago,
           ${SUB_PRODUCTO_BOTELLON_CASE} AS sub_producto_botellon,
+          (dd.total = 0 AND dd.cantidad > 0) AS es_regalia,
           dd.cantidad AS unidades,
           dd.total    AS dolares,
           doc.code    AS doc_code
@@ -118,7 +126,7 @@ const obtenerVentasPorRuta = async (req, res) => {
         JOIN detalle_documento dd ON dd.documento_code = doc.code
         LEFT JOIN clientes c ON c.codigo_cliente = doc.customer_code
       ) base
-      GROUP BY GROUPING SETS ((categoria), (condicion_pago), (sub_producto_botellon), ())
+      GROUP BY GROUPING SETS ((categoria), (condicion_pago), (sub_producto_botellon), (es_regalia), ())
     `;
 
     const filas = await sequelize.query(sql, {
@@ -130,20 +138,32 @@ const obtenerVentasPorRuta = async (req, res) => {
     const por_condicion_pago = { CONTADO: null, CREDITO: null, SIN_DATO: null };
     const porSubProducto = { LIQUIDO_PET: null, ENVASE_PET: null, LIQUIDO_PP: null, ENVASE_PP: null, COMPUESTO: null };
     let total = { unidades: 0, dolares: 0 };
+    let regalia = { unidades: 0, documentos: 0 };
 
+    // Con 5 dimensiones en GROUPING SETS, cada fila trae las OTRAS 4 en NULL
+    // (semántica estándar de GROUPING SETS) — hay que exigir las 4 en NULL
+    // para identificar a qué "vista" pertenece cada fila, si no una fila de
+    // (es_regalia) se cuela como si fuera de (categoria), etc.
     for (const r of filas) {
       const unidades = Number(r.unidades) || 0;
       const dolares = Number(Number(r.dolares || 0).toFixed(2));
       const documentos = Number(r.documentos) || 0;
+      const soloCategoria = r.categoria != null && r.condicion_pago == null && r.sub_producto_botellon == null && r.es_regalia == null;
+      const soloCondicionPago = r.condicion_pago != null && r.categoria == null && r.sub_producto_botellon == null && r.es_regalia == null;
+      const soloSubProducto = r.sub_producto_botellon != null && r.categoria == null && r.condicion_pago == null && r.es_regalia == null;
+      const soloRegalia = r.es_regalia != null && r.categoria == null && r.condicion_pago == null && r.sub_producto_botellon == null;
+      const esTotalGeneral = r.categoria == null && r.condicion_pago == null && r.sub_producto_botellon == null && r.es_regalia == null;
 
-      if (r.categoria == null && r.condicion_pago == null && r.sub_producto_botellon == null) {
+      if (esTotalGeneral) {
         total = { unidades, dolares };
-      } else if (r.condicion_pago == null && r.sub_producto_botellon == null) {
+      } else if (soloCategoria) {
         por_categoria.push({ categoria: r.categoria, unidades, dolares });
-      } else if (r.categoria == null && r.sub_producto_botellon == null && r.condicion_pago != null) {
+      } else if (soloCondicionPago) {
         por_condicion_pago[r.condicion_pago] = { unidades, dolares, documentos };
-      } else if (r.categoria == null && r.condicion_pago == null && r.sub_producto_botellon != null) {
+      } else if (soloSubProducto) {
         porSubProducto[r.sub_producto_botellon] = { unidades, dolares };
+      } else if (soloRegalia && (r.es_regalia === true || r.es_regalia === "t")) {
+        regalia = { unidades, documentos };
       }
     }
 
@@ -168,6 +188,7 @@ const obtenerVentasPorRuta = async (req, res) => {
         credito: por_condicion_pago.CREDITO || vacio,
         sin_dato: por_condicion_pago.SIN_DATO || vacio,
       },
+      regalia,
       por_producto_botellon: {
         liquido_pet: {
           unidades: liquidoPetBase.unidades + compuesto.unidades,
@@ -272,4 +293,131 @@ const obtenerPrecioPromedioLiquido = async (req, res) => {
   }
 };
 
-module.exports = { obtenerVentasPorRuta, obtenerPrecioPromedioLiquido };
+// GET /api/ventas-por-ruta/por-producto?ruta=&fecha_inicio=&fecha_fin=&ids=40,4814,1476
+// Genérico, por codigo_producto crudo (05-oct-2026, bloque A — descartable/
+// hielo) — a propósito SIN clasificación/descomposición (eso es para
+// botellón, que tiene el caso especial de COMPUESTO). Cualquier mapeo de
+// "estos ids son el mismo producto" (alias de compañía, etc.) se resuelve
+// del lado de icl-backend (tabla producto_alias_ids), que es donde vive esa
+// relación — este endpoint es una agregación cruda, no debe duplicar ese
+// conocimiento acá.
+const obtenerVentaPorProducto = async (req, res) => {
+  try {
+    const { ruta, fecha_inicio, fecha_fin, ids } = req.query;
+
+    if (!ruta || !fecha_inicio || !fecha_fin || !ids) {
+      return res.status(400).json({ error: "Debe enviar ruta, fecha_inicio, fecha_fin e ids" });
+    }
+    if (!FECHA_REGEX.test(fecha_inicio) || !FECHA_REGEX.test(fecha_fin)) {
+      return res.status(400).json({ error: "fecha_inicio y fecha_fin deben tener formato YYYY-MM-DD" });
+    }
+    const listaIds = ids.split(",").map((s) => s.trim()).filter(Boolean);
+    if (!listaIds.length) {
+      return res.status(400).json({ error: "ids no puede quedar vacío" });
+    }
+
+    const inicio = `${fecha_inicio} 00:00:00`;
+    const finDate = new Date(`${fecha_fin}T00:00:00Z`);
+    finDate.setUTCDate(finDate.getUTCDate() + 1);
+    const fin = finDate.toISOString().replace("T", " ").substring(0, 19);
+
+    const sql = `
+      SELECT dd.codigo_producto, SUM(dd.cantidad) AS unidades, SUM(dd.total) AS dolares
+      FROM (
+        SELECT o.code FROM ordenes o
+        WHERE o.route_code = :ruta AND o.status IN (2,4,5)
+          AND o.fecha_creacion >= :inicio AND o.fecha_creacion < :fin
+        UNION ALL
+        SELECT f.code FROM facturas f
+        WHERE f.route_code = :ruta AND f.status IN (2,4,5)
+          AND f.fecha_creacion >= :inicio AND f.fecha_creacion < :fin
+      ) doc
+      JOIN detalle_documento dd ON dd.documento_code = doc.code
+      WHERE dd.codigo_producto IN (:ids)
+      GROUP BY dd.codigo_producto
+    `;
+
+    const filas = await sequelize.query(sql, {
+      replacements: { ruta, inicio, fin, ids: listaIds },
+      type: Sequelize.QueryTypes.SELECT,
+    });
+
+    const por_producto = {};
+    for (const id of listaIds) por_producto[id] = { unidades: 0, dolares: 0 };
+    for (const r of filas) {
+      por_producto[r.codigo_producto] = { unidades: Number(r.unidades) || 0, dolares: Number(Number(r.dolares || 0).toFixed(2)) };
+    }
+
+    return res.json({ por_producto });
+  } catch (error) {
+    console.error("❌ ERROR VENTA POR PRODUCTO:", error);
+    return res.status(500).json({ message: "Error al obtener venta por producto", detail: error.message });
+  }
+};
+
+// GET /api/ventas-por-ruta/precio-promedio-producto?ids=40,1476,...&dias=60
+// Genérico (05-oct-2026, bloque B) — mismo concepto que precio-promedio-
+// liquido (Fuente B, promedio real transaccional, NUNCA list_price) pero
+// por codigo_producto arbitrario, sin PET/PP ni COMPUESTO — eso es
+// específico de botellón. Lo usa DESCARTABLE para cobrar diferencia sin
+// explicar con el mismo patrón que líquido. Agregado GLOBAL (todas las
+// rutas), ventana móvil — se recalcula en cada llamada, nunca hardcodeado.
+const obtenerPrecioPromedioProducto = async (req, res) => {
+  try {
+    const dias = parseInt(req.query.dias, 10) || 60;
+    const { ids } = req.query;
+    if (!ids) {
+      return res.status(400).json({ error: "Debe enviar ids" });
+    }
+    if (dias <= 0 || dias > 365) {
+      return res.status(400).json({ error: "dias debe ser un entero entre 1 y 365" });
+    }
+    const listaIds = ids.split(",").map((s) => s.trim()).filter(Boolean);
+    if (!listaIds.length) {
+      return res.status(400).json({ error: "ids no puede quedar vacío" });
+    }
+
+    const sql = `
+      SELECT dd.codigo_producto, SUM(dd.cantidad) AS unidades, SUM(dd.total) AS dolares
+      FROM (
+        SELECT o.code FROM ordenes o
+        WHERE o.status IN (2,4,5) AND o.fecha_creacion >= now() - make_interval(days => :dias)
+        UNION ALL
+        SELECT f.code FROM facturas f
+        WHERE f.status IN (2,4,5) AND f.fecha_creacion >= now() - make_interval(days => :dias)
+      ) doc
+      JOIN detalle_documento dd ON dd.documento_code = doc.code
+      WHERE dd.codigo_producto IN (:ids) AND dd.total > 0
+      GROUP BY dd.codigo_producto
+    `;
+
+    const filas = await sequelize.query(sql, {
+      replacements: { dias, ids: listaIds },
+      type: Sequelize.QueryTypes.SELECT,
+    });
+
+    const por_producto = {};
+    for (const id of listaIds) por_producto[id] = { unidades: 0, dolares: 0, precio_promedio: null };
+    for (const r of filas) {
+      const unidades = Number(r.unidades) || 0;
+      const dolares = Number(Number(r.dolares || 0).toFixed(2));
+      por_producto[r.codigo_producto] = {
+        unidades,
+        dolares,
+        precio_promedio: unidades > 0 ? Number((dolares / unidades).toFixed(4)) : null,
+      };
+    }
+
+    return res.json({ dias, por_producto });
+  } catch (error) {
+    console.error("❌ ERROR PRECIO PROMEDIO PRODUCTO:", error);
+    return res.status(500).json({ message: "Error al calcular precio promedio por producto", detail: error.message });
+  }
+};
+
+module.exports = {
+  obtenerVentasPorRuta,
+  obtenerPrecioPromedioLiquido,
+  obtenerVentaPorProducto,
+  obtenerPrecioPromedioProducto,
+};
