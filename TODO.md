@@ -5159,6 +5159,284 @@ sección se probó copiando el código al contenedor vivo sin reiniciarlo,
 por la misma disciplina de esta sesión de no redesplegar `dashboard_backend`
 sin autorización explícita aparte.
 
+## ✅ Ampliación de `auditoriaClientes` (Fase 1b) — filtro por compañía, paginación, nuevos subtipos de coordenadas, contexto, duplicados mejorados
+
+### El pedido
+
+Ampliar la tool `auditoriaClientes` (Fase 1, solo diagnóstico, ya en
+producción) sin tocar su naturaleza de solo lectura: filtro por
+`company_id`, paginación real (sin tope de 500), nuevos subtipos de
+`coordenadas`, contexto por registro (última compra, ruta, grupo, etc.) en
+`coordenadas`/`duplicados`, y 5 mejoras a la detección de duplicados. No
+tocar ninguna otra tool.
+
+### Hallazgos de la investigación (antes de construir)
+
+- `clientes.company_id` (MobilVendor) YA coincide 1:1 con `res.company` de
+  Odoo (mismos 5 ids ya validados en `facturasProveedores`: 1=GRUPOAQUA,
+  2=AQUASUPPLY, 3=COTTSA, 4=IIBC, 5=DISTRINTER) Y trae
+  `descripcion_company` (el nombre) en la misma fila — `listar_companias`
+  no necesita tocar Odoo, sale 100% de Postgres. 2,340 de 20,431 clientes
+  tienen `company_id` NULL.
+- `pg_trgm` (`similarity()`) y `unaccent` YA están instalados en esta base
+  (`unaccent` ya se usaba en `ventasCliente.js`) — se reutilizan sin
+  agregar dependencias nuevas, para nombre normalizado y las 2 señales
+  nuevas de similitud.
+- `codigo_cliente` tiene exactamente 3 patrones reales (confirmado con
+  datos): NUMERICO (20,136), 'GA...' (233), 'CL...' (151) — usado para
+  `origen_codigo`.
+- **FORMATO_INVALIDO** (coordenada no numérica/con coma/texto): la columna
+  real (`direcciones_clientes.latitud_direccion_cliente`/`longitud_...`)
+  es `NUMERIC(15,8)` — Postgres RECHAZA cualquier valor no numérico al
+  insertar. Este tipo de problema **no puede existir hoy** en los datos ya
+  guardados — se implementó de todos modos (defensivo, por si cambia el
+  tipo de columna algún día) pero siempre da 0, confirmado con datos
+  reales, no es un bug del código.
+- **BAJA_PRECISION** (menos de 4 decimales): la columna de escala fija
+  rellena con ceros hasta 8 decimales al guardar — no se puede recuperar
+  la precisión ORIGINAL real (un valor cargado con 1 decimal se ve igual
+  en texto crudo que un GPS real que termine en .X0000000 por
+  coincidencia). Se usa como proxy la cantidad de decimales
+  SIGNIFICATIVOS tras recortar ceros finales — aproximación razonable,
+  documentada, no medición exacta. Con datos reales: 77 casos.
+
+### Lo construido
+
+- `company_id` (opcional) filtra TODAS las categorías, patrón
+  `($N::text IS NULL OR company_id = $N)` (nunca concatenación). Cada item
+  devuelve `company_id`.
+- `listar_companias=true`: compañías reales + conteo de clientes, sin
+  tocar ninguna otra categoría.
+- Paginación real: `offset` (default 0), `limite` hasta 2000 (antes tope
+  500 fijo), respuesta con `total`/`offset`/`limite`/`hay_mas`.
+  `formato_salida='resumen_por_tipo'`: solo conteos, sin `items`.
+- `coordenadas`: 10 subtipos (`tipo_problema` filtra a uno). Nuevos:
+  SOLO_LATITUD/SOLO_LONGITUD (antes colapsaban en NULA),
+  LAT_LON_INVERTIDAS (lat cae en rango de longitud de Ecuador y viceversa
+  — columnas cruzadas), LAT_IGUAL_LON, FORMATO_INVALIDO, BAJA_PRECISION
+  (ver hallazgos arriba). Rango válido ampliado (incluye Galápagos,
+  marcado con `en_galapagos`). Cada item trae contexto (`ultima_compra`,
+  `dias_desde_ultima`, `ruta`+`grupo` del documento MÁS RECIENTE real —
+  mismo patrón exacto que `clientesSinVisita.js` — `ventas_12m`,
+  `telefono`, `ciudad`, `fecha_creacion`), ordenado por `ventas_12m`
+  descendente, filtrable con `solo_activos_dias`.
+- `duplicados` — de 2 señales a 7:
+  1. `senal_fuerte` (igual que antes: RUC+company_id+nombre EXACTO).
+  2. `senal_fuerte_normalizada` (NUEVA): mismo RUC, nombres EXACTOS
+     distintos pero IDÉNTICOS tras normalizar (mayúsculas, `unaccent`,
+     sin puntuación, sin sufijo societario SA/SAS/CIA LTDA/CA vía regex
+     `\y...\y` de Postgres) — ej. "S.A" vs "S.A.". Antes cualquiera de
+     estos caía en `senal_debil` sin distinguirlo de una ambigüedad de
+     negocio real.
+  3. `senal_debil` (igual criterio que antes, pero AHORA excluye los
+     casos que se movieron a `senal_fuerte_normalizada`).
+  4. `equivalencia_cedula_ruc` (NUEVA): cédula de 10 dígitos y RUC de
+     esos mismos 10 + "001" bajo `codigo_cliente` DISTINTOS — el chequeo
+     de RUC exacto nunca los agarra porque el valor crudo difiere.
+     Ejemplos reales confirmados antes de construir (ver investigación
+     en el propio código).
+  5. `mismo_telefono` (NUEVA): mismo teléfono (normalizado: solo dígitos,
+     sin prefijo 593/0, mínimo 7 dígitos para evitar valores genéricos)
+     bajo RUC distinto + nombre con `similarity()` > 0.85 — self-join en
+     SQL, sin loops en JS.
+  6. `mismo_pin` (NUEVA): misma coordenada EXACTA (no nula, no (0,0), no
+     ya cubierta por PIN_POR_DEFECTO de >5 clientes) bajo RUC distinto +
+     nombre similar > 0.85.
+  7. `nombres_problematicos` (NUEVA): `nombre_cliente` nulo o con
+     espacios/saltos de línea al borde (antes de cualquier
+     normalización) — 590 casos reales.
+  Cada grupo trae `detalle` por código (nombre, `origen_codigo`
+  NUMERICO/GA/CL, `fecha_creacion`, `ultima_compra`, `ventas_12m`,
+  `ruta`, `telefono`, coordenadas) y `sugerencia_maestro` (el código con
+  más `ventas_12m` del grupo — SOLO sugerencia, nunca una acción).
+  `incluir_cadenas=true` lista también las cadenas grandes normalmente
+  excluidas de `senal_debil`.
+
+### Bug encontrado y corregido DURANTE la construcción (antes de dar por buena la tool)
+
+`senal_debil.total` usaba accidentalmente el largo de la lista YA
+excluida de cadenas grandes (`senalDebilItems`, post-filtro de listado)
+en vez del total genuino de grupos (`debilGenuino`, antes de esa
+exclusión) — detectado comparando contra una query SQL independiente
+corrida a mano: el total esperado (universo completo mismo-RUC-nombres-
+distintos, 517 con datos de hoy) tenía que repartirse EXACTO entre
+`senal_debil` + `senal_fuerte_normalizada`, y daba 477 en vez de 517 (un
+hueco de 40, exactamente el número de cadenas grandes excluidas del
+listado). Corregido separando `total` (siempre el universo genuino) de
+`items` (lo efectivamente paginable, que sí respeta la exclusión de
+cadenas) — `paginar()` ahora acepta un `totalReal` opcional, y `hay_mas`
+se calcula contra el largo real de `items`, no contra `totalReal` (para
+no decir "hay más" cuando lo que resta son grupos excluidos, no una
+página siguiente real).
+
+### Validación con datos reales — comparación contra el baseline pedido
+
+Rango: base completa (sin `company_id`) vs. `company_id=1`. El baseline
+citado (2646 coordenadas / 983 fuerte / 516 débil) fue medido hace
+semanas — con datos de HOY, la misma lógica vieja da 2647*/984/517
+(*antes de sumar las categorías nuevas) — drift de 1-2, normal en una
+base viva, no una regresión.
+
+| | Sin filtro (toda la base) | `company_id=1` (GRUPOAQUA) |
+|---|---|---|
+| coordenadas (total, 10 tipos) | 2,725 | 2,410 |
+| — de eso, equivalente a categorías viejas (NULA+SOLO_LAT+SOLO_LON+CERO_CERO+PIN_DEFECTO+FUERA_RANGO) | 2,647 | — |
+| — nuevas (BAJA_PRECISION+LAT_IGUAL_LON) | 78 | — |
+| duplicados.senal_fuerte | 984 | 968 |
+| duplicados.senal_fuerte_normalizada (nueva, salió de debil) | 52 | 18 |
+| duplicados.senal_debil (ya sin los normalizados) | 465 | 376 |
+| duplicados.equivalencia_cedula_ruc (nueva) | 146 | 102 |
+| duplicados.mismo_telefono (nueva) | 50 | 44 |
+| duplicados.mismo_pin (nueva) | 18 | 18 |
+| duplicados.nombres_problematicos (nueva) | 590 | 482 |
+
+`listar_companias`: 1=GRUPOAQUA S.A. (17,533), NULL (2,340), 5=DISTRINTER
+(312), 3=COTTSA (282), 4=IIBC S.A. (33), 2=AQUASUPPLY S.A. (20) — suma
+exacta al total de `clientes` (20,520 al momento de la prueba).
+
+### Validación técnica (suite completa, `node:20-alpine`)
+
+`seguridad-smoke-test` OK (inyección en `company_id` probada —
+`"1'; DROP TABLE clientes; --"` no rompe nada, tabla intacta),
+`oauth-smoke-test` OK (17 tools, sin cambios — esta tarea amplía una tool
+existente, no registra ninguna nueva), `ventasPorCondicionPago-real` OK,
+`clasificacionRutaCombinada-real` OK, `clasificacionDomicilioEquipo-real`
+OK (sin regresión en nada fuera de `auditoriaClientes`, como se pidió).
+`auditoriaClientes-real` (el test viejo) actualizado en 1 sola aserción
+(la partición nueva de `senal_debil`, documentado inline por qué) y en
+verde. Nuevo `auditoriaClientesAmpliacion-real.test.js` (24 aserciones,
+incluye la regresión del bug de arriba) en verde.
+
+### Fuera de alcance / decisiones explícitas
+
+No se tocó ninguna otra tool (`clientesSinVisita`, `clientesSinConsumo`,
+etc.), confirmado por grep — solo se REUTILIZARON `CASE_GRUPO_ORDENES`/
+`CASE_GRUPO_FACTURAS` de `clasificacion.js`, nunca se copiaron ni
+reescribieron. No se agregó campo `provincia` (pedido en el mensaje
+original) — ni `clientes` ni `direcciones_clientes` tienen esa columna;
+se expone `ciudad_cliente` tal cual existe, sin inventar un campo que no
+está en los datos. `dashboard_backend`/`mcp_server` **no se
+redesplegaron** — pendiente de que el usuario revise el diff y autorice.
+
+## 🐛 Dos reportes de Kenny Navas (bodega, vía Slack, 2026-10-01)
+
+### Bug 1 — `ventasCliente` sobrecuenta unidades/dólares — DIAGNOSTICADO, fix PROPUESTO, no implementado todavía
+
+**El reporte**: cliente MUÑOZ TABAREZ PAUL LENIN, producto BOTELLÓN 20L
+AQUA PREMIUM (LIQUÍDO), septiembre 2026. El MCP devolvió $5,990.68 / 3,990
+unidades (29 documentos). Kenny contó a mano: 3,235 unidades brutas, menos
+125 de un documento en $0 (regalía) = 3,110 netas.
+
+**Hipótesis descartada (pedido explícito de revisar primero)**: ¿cliente
+duplicado por RUC, sumando 2 registros como si fueran uno? NO — confirmado
+con datos reales: RUC `0917064057` tiene exactamente 1 fila en `clientes`
+(`codigo_cliente=228561`), sin duplicado señal fuerte ni débil. Esta
+hipótesis queda descartada con evidencia, no solo revisada.
+
+**Causa real, encontrada y reconciliada al centavo**: `facturas` tiene
+**37 documentos** (de ~527K totales — 0.007%, pero `concentrados y
+empeorando`: 27 de los 37 son del último mes, 2026-08-31 en adelante) con
+código `FAM#-NNNNNN` (ej. `FAM6-000135`) que son el **mismo documento real**
+que otro con código `FA0XX-XXX-NNNNNN` (ej. `FA001-106-000000142`) —
+mismo `customer_code`, misma `fecha_creacion`, mismo `total`/`cantidad`
+EXACTOS. `SQL_HISTORIAL` de `ventasCliente.js` (y de cualquier otra tool
+que sume `facturas` sin deduplicar) cuenta AMBOS como si fueran 2 ventas
+distintas.
+
+Reconciliación exacta para este caso (codigo_producto=28, "BOTELLÓN 20L
+AQUA PREMIUM (LIQUÍDO)", septiembre 2026, codigo_cliente=228561):
+
+| Fuente | Unidades | Dólares |
+|---|---|---|
+| `ordenes` (19 docs, incluye el $0 de regalía de 125u) | 2,480 | $3,650.20 |
+| `facturas` código `FA001-106-...` (5 docs, el real) | 755 | $1,170.24 |
+| `facturas` código `FAM6-...` (5 docs, **duplicado del anterior**) | 755 | $1,170.24 |
+| **Suma correcta** (ordenes + facturas contado 1 vez) = **bruto real de Kenny** | **3,235** | — |
+| Menos regalía $0 (125u) = **neto de Kenny** | **3,110** | — |
+| **Suma con el bug** (ordenes + AMBOS códigos de factura) = **lo que devolvió el MCP** | **3,990** | **$5,990.68** |
+
+Los 3 números (3235 bruto, 3110 neto, 3990 reportado, $5,990.68) coinciden
+EXACTOS con lo que dijo Kenny — la causa está encontrada, no es una
+hipótesis.
+
+**Por qué NO se puede excluir `FAM%` a ciegas**: de los 37 documentos
+`FAM#` totales, solo ~26 tienen un "gemelo" real (mismo customer+fecha+
+total bajo otro código). Los ~11 restantes (todos de antes de agosto 2026,
+esporádicos) NO tienen gemelo — son la ÚNICA representación de esa venta.
+Excluir por prefijo de código borraría ventas reales. El fix correcto
+tiene que ser consciente del gemelo (self-join por customer_code+fecha+
+total, igual que se usó para detectarlos en esta investigación), no un
+filtro estático.
+
+**Propuesta de fix (NO implementada, pendiente de confirmación)**: en
+`SQL_HISTORIAL` (y cualquier otra query de `facturas` que se vea
+afectada), deduplicar documentos `facturas` donde existan 2+ códigos con
+mismo `customer_code`+`fecha_creacion`+`total` (y, idealmente,
+`origen_sistema`/`tipo_movimiento` para no fundir coincidencias legítimas)
+quedándose con uno solo — el candidato natural es preferir el código con
+`tipo_movimiento` poblado (el "real"/oficial) sobre el que lo tiene vacío.
+Queda por decidir: ¿implementar esto en cada tool que toca `facturas`
+(riesgo de repetir la lógica 6+ veces), o en una vista/CTE compartida? Y
+sobre todo: esto es un síntoma de un problema de SYNC (¿por qué
+`sincronizacionService.js` o el flujo de Odoo está creando 2 documentos
+para la misma venta?) — la causa raíz real puede estar en backend, no en
+mcp-server; este análisis no llegó a investigar el código de sync en sí,
+solo confirmó el síntoma en los datos.
+
+### Bug 2 — `auditoriaClientes` mezclaba archivados sin distinguirlos — RESUELTO
+
+**El reporte**: los clientes de la categoría "coordenadas mal puestas" en
+varios casos ya están archivados en Odoo (`res.partner.active=false`).
+Pedido: confirmar qué categorías filtran por eso, y si no filtran,
+**separar el conteo** (no excluir) — mismo criterio que
+`activos_sin_consumo`. Importante porque esa lista alimenta
+`auditoriaParadasFlota`.
+
+**Confirmado antes de corregir**: de las 5 categorías, solo
+`activos_sin_consumo` tocaba `res.partner.active` (es su criterio
+central). Las otras 4 (`direcciones_incompletas`, `coordenadas`,
+`duplicados` — las 7 señales —, `sin_canal`) nunca llamaban a Odoo.
+Confirmado con `grep` de `fetchOdooActivoPorRuc`/`res.partner` antes del
+fix.
+
+**Implementado**: cada una de esas 4 categorías ahora trae `activo_odoo`
+(`'ACTIVO'`/`'ARCHIVADO'`/`'SIN_MATCH_ODOO'`/`'SIN_RUC'`) por item, y
+`por_estado_odoo` (desglose) a nivel de categoría/señal — en
+`formato_salida='resumen_por_tipo'` y en el JSON completo, siempre
+consistentes entre sí. `activos_sin_consumo` queda SIN este campo a
+propósito (ya usa `res.partner.active` como FILTRO, no como dimensión —
+agregarle el split sería 100% ACTIVO por construcción, redundante). El
+mapa `activoOdooPorRuc` (`fetchOdooActivoPorRuc()`, función reutilizada
+tal cual, no reescrita) ahora se trae UNA sola vez por llamada a
+`auditoriaClientes()` desde el orquestador — antes, en un `resumen` sin
+categoría, se hubiera llamado 2 veces (acá + adentro de
+`activos_sin_consumo`).
+
+**Validado con datos reales — confirma el reporte de Kenny con números**:
+
+| Categoría | ACTIVO | ARCHIVADO | SIN_MATCH_ODOO | SIN_RUC |
+|---|---|---|---|---|
+| coordenadas | 2,533 | **155** | 30 | 6 |
+| direcciones_incompletas | 371 | **133** | 6 | 0 |
+| sin_canal | 6,445 | **2,795** | 438 | 139 |
+
+155 de 2,724 candidatos de "coordenadas mal puestas" (5.7%) ya están
+archivados — exactamente el tipo de contaminación que Kenny reportó, y
+que habría pasado directo a `auditoriaParadasFlota` sin este fix.
+Verificado en vivo (no solo confiado en la tool): tomado el primer item
+`ARCHIVADO` del JSON completo, confirmado por una llamada INDEPENDIENTE a
+`res.partner.search_read` que su RUC real tiene `active=false`.
+
+### Validación técnica (ambos bugs)
+
+Suite completa (`node:20-alpine`): `seguridad-smoke-test` OK,
+`oauth-smoke-test` OK (17 tools, sin cambios), `auditoriaClientes-real`
+OK (sin regresión), `auditoriaClientesAmpliacion-real` OK (sin
+regresión). Nuevo `auditoriaClientesEstadoOdoo-real.test.js` (24
+aserciones, incluye la verificación en vivo contra Odoo) en verde. Bug 1
+NO tiene cambio de código (diagnóstico + propuesta, pendiente de
+confirmación antes de tocar `ventasCliente.js`).
+
 ## 🐛✅ Fix: `ventasCliente` sobrecontaba unidades/dólares por documentos duplicados en `facturas` (reportado por Kenny Navas, bodega, vía Slack, 2026-10-01)
 
 ### El reporte y la causa (ver también el PR #11 de `auditoriaClientes`, donde se investigó esto por primera vez junto con otro bug — acá queda el detalle completo y el fix)

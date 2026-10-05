@@ -84,9 +84,17 @@ async function main() {
     resultadoDup.senal_fuerte.total === Number(fuerteReal[0].n),
     `duplicados.senal_fuerte: total tool (${resultadoDup.senal_fuerte.total}) == SQL directo (${fuerteReal[0].n})`
   );
+  // AMPLIACIÓN 2026-10-01: senal_debil ya NO es "mismo RUC, nombres EXACTOS
+  // distintos" completo — ese universo se partió en 2 (senal_debil +
+  // senal_fuerte_normalizada, ver auditoriaClientes.js) según si el nombre
+  // NORMALIZADO coincide o no. La comparación contra el SQL crudo (que
+  // sigue midiendo el universo viejo completo) ahora es contra la SUMA de
+  // ambas señales, no solo senal_debil — ver
+  // auditoriaClientesAmpliacion-real.test.js para la prueba dedicada de la
+  // partición en sí.
   asegurar(
-    resultadoDup.senal_debil.total === Number(debilReal[0].n),
-    `duplicados.senal_debil: total tool (${resultadoDup.senal_debil.total}) == SQL directo (${debilReal[0].n})`
+    resultadoDup.senal_debil.total + resultadoDup.senal_fuerte_normalizada.total === Number(debilReal[0].n),
+    `duplicados.senal_debil + senal_fuerte_normalizada (${resultadoDup.senal_debil.total} + ${resultadoDup.senal_fuerte_normalizada.total}) == SQL directo del universo completo (${debilReal[0].n})`
   );
   asegurar(
     resultadoDup.senal_fuerte.items.every((i) => i.codigos.length > 1),

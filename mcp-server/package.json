@@ -22,6 +22,8 @@
     "test:fallback-odoo-condicion-real": "node test/fallbackOdooCondicionPago-real.test.js",
     "test:clasificacion-domicilio-equipo-real": "node test/clasificacionDomicilioEquipo-real.test.js",
     "test:auditoria-clientes-real": "node test/auditoriaClientes-real.test.js",
+    "test:auditoria-clientes-ampliacion-real": "node test/auditoriaClientesAmpliacion-real.test.js",
+    "test:auditoria-clientes-estado-odoo-real": "node test/auditoriaClientesEstadoOdoo-real.test.js",
     "test:ventas-cliente-facturas-duplicadas-real": "node test/ventasClienteFacturasDuplicadas-real.test.js"
   },
   "dependencies": {
