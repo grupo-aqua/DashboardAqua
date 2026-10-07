@@ -5,11 +5,13 @@ const {
   obtenerPrecioPromedioLiquido,
   obtenerVentaPorProducto,
   obtenerPrecioPromedioProducto,
+  obtenerDocumentoPorCode,
 } = require("../../controllers/controllerVentasPorRuta/ventasPorRutaController");
 
 router.get("/", obtenerVentasPorRuta);
 router.get("/precio-promedio-liquido", obtenerPrecioPromedioLiquido);
 router.get("/por-producto", obtenerVentaPorProducto);
 router.get("/precio-promedio-producto", obtenerPrecioPromedioProducto);
+router.get("/documento", obtenerDocumentoPorCode);
 
 module.exports = router;

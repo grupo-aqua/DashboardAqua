@@ -415,9 +415,68 @@ const obtenerPrecioPromedioProducto = async (req, res) => {
   }
 };
 
+// GET /api/ventas-por-ruta/documento?code=<code>
+// 07-oct-2026 (plan ICL punto K.2) — búsqueda de UN documento por su code,
+// SIN filtrar por route_code. Soporta el caso que K.1 identificó: pedidos
+// facturados desde oficina/otro canal pero entregados físicamente por una
+// ruta (route_code no los captura, o queda NULL — ver nota en
+// sincronizacionOdooService.js, esa asignación está deliberadamente
+// deshabilitada hoy). Deja que el liquidador encuentre el documento igual,
+// por su código, y lo anexe manualmente a la ruta que lo entregó — no
+// decide nada de atribución automática, es una búsqueda neutra.
+const obtenerDocumentoPorCode = async (req, res) => {
+  try {
+    const { code } = req.query;
+    if (!code) {
+      return res.status(400).json({ error: "Debe enviar code" });
+    }
+
+    const sql = `
+      SELECT doc.code, doc.origen, doc.route_code, doc.customer_code,
+             doc.fecha_creacion,
+             SUM(dd.cantidad) AS unidades,
+             SUM(dd.total)    AS dolares
+      FROM (
+        SELECT o.code, o.route_code, o.customer_code, o.fecha_creacion, 'orden' AS origen
+        FROM ordenes o WHERE o.code = :code
+        UNION ALL
+        SELECT f.code, f.route_code, f.customer_code, f.fecha_creacion, 'factura' AS origen
+        FROM facturas f WHERE f.code = :code
+      ) doc
+      JOIN detalle_documento dd ON dd.documento_code = doc.code
+      GROUP BY doc.code, doc.origen, doc.route_code, doc.customer_code, doc.fecha_creacion
+    `;
+
+    const filas = await sequelize.query(sql, {
+      replacements: { code },
+      type: Sequelize.QueryTypes.SELECT,
+    });
+
+    if (!filas.length) {
+      return res.json({ encontrado: false });
+    }
+
+    const doc = filas[0];
+    return res.json({
+      encontrado: true,
+      code: doc.code,
+      origen: doc.origen,
+      route_code: doc.route_code || null,
+      customer_code: doc.customer_code,
+      fecha: doc.fecha_creacion,
+      unidades: Number(doc.unidades) || 0,
+      dolares: Number(Number(doc.dolares || 0).toFixed(2)),
+    });
+  } catch (error) {
+    console.error("❌ ERROR DOCUMENTO POR CODE:", error);
+    return res.status(500).json({ message: "Error al buscar el documento", detail: error.message });
+  }
+};
+
 module.exports = {
   obtenerVentasPorRuta,
   obtenerPrecioPromedioLiquido,
   obtenerVentaPorProducto,
   obtenerPrecioPromedioProducto,
+  obtenerDocumentoPorCode,
 };
