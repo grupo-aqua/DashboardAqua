@@ -6475,5 +6475,81 @@ JSON↔resumen_por_tipo) en verde.
 
 ### Estado
 
-PR nuevo (`fix/duplicados-vinculo-odoo`), **sin mergear ni desplegar**
+~~PR nuevo..., sin mergear ni desplegar~~ → **mergeado (PR #14) y
+desplegado a producción, verificado en vivo** (commit `9bcea42`,
+`/health` + llamada MCP real contra el caso Chichanda).
+
+## ✅ Implementado — `duplicados_en_odoo`, la definición ESTRICTA de duplicado que pidió el usuario (2026-10-14)
+
+Seguimiento del fix de arriba: una vez visto `clasificacion_vinculo` en
+vivo, el usuario aclaró su propia definición real de "duplicado" —
+"que en MI base de Odoo haya dos contactos con mismo nombre/cédula/RUC,
+AMBOS activos — porque eso no se puede hacer". Nada de lo construido
+hasta ahora respondía exactamente eso (todo partía de `clientes`/
+MobilVendor, cruzando a Odoo solo para dar contexto).
+
+### Investigación — 2 rondas de corrección con datos reales antes de implementar
+
+**Ronda 1**: agrupar `res.partner` (customer_rank>0, active=true) solo
+por `vat` (RUC) — dio **516 grupos**. Casi todo ruido: empresas grandes
+con muchas sucursales reales bajo el mismo RUC corporativo (ACCIONA: 9
+sitios activos: "LOS MERINOS", "PROGRESO", etc.; TERPEL: 20
+gasolineras) — estructura real, no duplicado.
+
+**Ronda 2**: agregar además `name` EXACTO (mismo RUC + mismo nombre,
+ambos activos) — bajó a **271 grupos**. El usuario verificó el primer
+caso ("ALARCON ALARCON ANA LUISA") en Odoo y **solo le aparecía 1
+contacto**. Investigado: los 2 partners (ids 179327 y 96365) existen
+de verdad, pero uno es `company_id=3` (COTTSA) y el otro `company_id=1`
+(GRUPOAQUA S.A.) — Grupo Aqua tiene varias empresas en la misma
+instancia de Odoo, la misma persona puede ser cliente real de más de
+una, cada relación con su propio partner legítimo, y Odoo por defecto
+solo muestra los contactos de la compañía activa en la UI.
+
+**Ronda 3 (la correcta)**: agregar también `company_id` al criterio —
+mismo patrón que ya usa `senal_fuerte` para MobilVendor
+(RUC+company_id+nombre) — bajó a **51 grupos**. El caso AQUASUPPLY S.A.
+(que tenía 4 ids) también se resolvió: son 4 compañías distintas
+(GRUPOAQUA, DISTRINTER, COTTSA, AQUASUPPLY), ninguna duplicada.
+**El usuario verificó los primeros 2 casos reales (ASOCIACION DE
+PROPIETARIOS...LA JOYA, AYALA VASQUEZ JAIME JAVIER) en Odoo antes de
+autorizar — ambos confirmados como duplicados reales.**
+
+### Diseño implementado
+
+`fetchDuplicadosOdoo(companyId)` — corre DIRECTO contra `res.partner`
+(ninguna dependencia de `clientes`/MobilVendor ni de las funciones
+`fetchOdooPorRuc`/`activoOdooPorRuc` ya existentes). Domain:
+`customer_rank>0, active=true, vat!=false` (+ `company_id` si se pasa
+el parámetro de la tool). Agrupa por `(vat, name.toUpperCase().trim(),
+company_id)`, filtra grupos con 2+ partners. Cada item trae `ruc`,
+`nombre`, `company_id`/`company_nombre`, `partners` (array de
+`{odoo_id, customer_rank, fecha_creacion}`) y
+`partner_con_mas_historial` (sugerencia DÉBIL — el de mayor
+`customer_rank` — NUNCA fusiona nada, Fase 1 sigue siendo
+solo-diagnóstico).
+
+Nuevo campo `duplicados_en_odoo` en `auditarDuplicados()` (tanto en
+`resumen_por_tipo` como en el formato completo con paginación), sin
+tocar ninguna de las 7 señales/campos ya existentes (`senal_fuerte`,
+`mismo_ruc_multiples_contactos_odoo`, etc. — siguen sirviendo para
+limpieza de códigos huérfanos en MobilVendor, un problema distinto).
+Descripción de la tool en `server.js` actualizada con la aclaración
+completa (por qué hace falta `company_id`, con el ejemplo real de
+ALARCON).
+
+### Validación
+
+`node --check` OK en los 4 archivos tocados. Suite completa
+(`seguridad`, `oauth`, `auditoria-clientes-real`,
+`-ampliacion-real`, `-estado-odoo-real`, `-vinculo-odoo-real`) sin
+regresión. Nuevo `test:auditoria-clientes-duplicados-odoo-real` (11
+aserciones): valida los 2 casos reales verificados por el usuario,
+confirma que ALARCON (el falso positivo de multi-compañía) NO aparece,
+`partner_con_mas_historial` correcto, `company_id` filtra también este
+campo nuevo, sumas exactas JSON↔resumen_por_tipo.
+
+### Estado
+
+PR nuevo (`fix/duplicados-reales-odoo`), **sin mergear ni desplegar**
 — pendiente de autorización.

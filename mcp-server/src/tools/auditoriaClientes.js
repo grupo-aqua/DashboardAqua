@@ -687,13 +687,14 @@ function detalleCodigosConVinculo(codigos, contexto, idsOdoo) {
 }
 
 async function auditarDuplicados(companyId, offset, limite, formatoSalida, incluirCadenas, activoOdooPorRuc, idsOdooPorRuc) {
-  const [fuerteRes, debilRes, equivRes, telRes, pinRes, nombresProbRes] = await Promise.all([
+  const [fuerteRes, debilRes, equivRes, telRes, pinRes, nombresProbRes, duplicadosOdoo] = await Promise.all([
     pool.query(sqlDuplicadosFuerte(), [companyId || null]),
     pool.query(sqlDuplicadosDebil(), [companyId || null]),
     pool.query(sqlEquivalenciaCedulaRuc(), [companyId || null]),
     pool.query(sqlMismoTelefono(), [companyId || null, UMBRAL_TELEFONO_DIGITOS_MIN, UMBRAL_SIMILITUD_NOMBRE]),
     pool.query(sqlMismoPin(), [companyId || null, UMBRAL_SIMILITUD_NOMBRE]),
     pool.query(sqlNombresProblematicos(), [companyId || null]),
+    fetchDuplicadosOdoo(companyId),
   ]);
 
   // Divide debil en senal_debil (nombres normalizados SIGUEN distintos) vs
@@ -787,6 +788,7 @@ async function auditarDuplicados(companyId, offset, limite, formatoSalida, inclu
 
   if (formatoSalida === "resumen_por_tipo") {
     return {
+      duplicados_en_odoo: { total: duplicadosOdoo.length },
       senal_fuerte: {
         total: senalFuerteItems.length,
         por_estado_odoo: porEstadoOdooCodigos(senalFuerteItems, (i) => i.codigos, contexto),
@@ -826,6 +828,10 @@ async function auditarDuplicados(companyId, offset, limite, formatoSalida, inclu
   }
 
   return {
+    duplicados_en_odoo: {
+      descripcion: "Duplicados REALES de Odoo — mismo RUC/cédula + mismo nombre EXACTO + MISMA compañía de Odoo (company_id), 2+ partners con active=true. A diferencia de TODO lo demás en esta categoría, esto corre directo contra res.partner — no depende de MobilVendor/`clientes` en absoluto. Exige company_id además de RUC+nombre porque Grupo Aqua tiene varias empresas en la misma instancia de Odoo y una misma persona/RUC puede ser cliente real de más de una (cada relación con su propio partner, legítimo) — sin ese filtro se cuentan de más los casos de multi-compañía (verificado con datos reales: 271 grupos solo con RUC+nombre, bajó a 51 agregando company_id). `partner_con_mas_historial` es solo una sugerencia débil (el partner con más customer_rank) — fusionar contactos de Odoo es una acción fuera de esta tool (Fase 1, solo diagnóstico).",
+      ...paginar(duplicadosOdoo, offset, limite),
+    },
     senal_fuerte: {
       descripcion: "Mismo RUC+company_id+nombre EXACTO en 2+ codigo_cliente, Y NO todos vinculados cada uno a su propio contacto en Odoo (ver `mismo_ruc_multiples_contactos_odoo` para esos) — duplicado real de MobilVendor. `clasificacion_vinculo` por grupo: UN_SOLO_VINCULADO (un código es el real en Odoo, el resto son huérfanos de MobilVendor — el caso más común y más accionable), NINGUNO_VINCULADO (ningún código vinculado a Odoo para este RUC) o PARCIAL (en grupos de 3+, algunos vinculados y otros no). `sugerencia_maestro` prioriza el código vinculado a Odoo cuando existe.",
       por_estado_odoo: porEstadoOdooCodigos(senalFuerteItems, (i) => i.codigos, contexto),
@@ -954,6 +960,74 @@ async function fetchOdooPorRuc() {
     idsPorRuc.get(ruc).add(String(p.id));
   }
   return { activoPorRuc, idsPorRuc };
+}
+
+// ============================================================
+// Duplicados REALES de Odoo — investigado 2026-10-14 (pedido explícito
+// del usuario: "para mí duplicado es que en MI base de Odoo haya dos
+// contactos con mismo nombre/cédula/RUC, ambos activos — porque eso no
+// se puede hacer"). A diferencia de TODO lo demás en esta categoría
+// (que parte de `clientes`/MobilVendor y cruza a Odoo solo para dar
+// contexto), esto corre DIRECTO contra `res.partner` — no depende de
+// MobilVendor en absoluto.
+//
+// Criterio: mismo `vat` (RUC/cédula) + mismo `name` EXACTO +
+// misma `company_id` de Odoo, 2+ partners con `active=true`.
+//
+// Por qué exige también `company_id` (no solo RUC+nombre) — verificado
+// en vivo con el primer caso real que trajo esta investigación ("ALARCON
+// ALARCON ANA LUISA" parecía duplicado con solo RUC+nombre, 271 grupos):
+// el usuario reportó que en Odoo solo le aparecía 1 contacto. Revisando
+// el detalle completo: son 2 contactos reales, uno en GRUPOAQUA S.A.
+// (company_id 1) y otro en COTTSA (company_id 3) — Grupo Aqua tiene
+// varias empresas en la misma instancia de Odoo y una misma persona
+// puede ser cliente real de más de una, cada relación con su propio
+// partner — Odoo además solo muestra los contactos de la compañía
+// activa en la UI, por eso el usuario veía solo uno. Agregando
+// `company_id` al criterio (mismo patrón que ya usa `senal_fuerte` para
+// MobilVendor: RUC+company_id+nombre) el número baja de 271 a 51 —
+// validado por el usuario contra Odoo en vivo para los 2 primeros casos
+// reales antes de implementar.
+async function fetchDuplicadosOdoo(companyId) {
+  const domain = [["customer_rank", ">", 0], ["active", "=", true], ["vat", "!=", false]];
+  if (companyId) domain.push(["company_id", "=", Number(companyId)]);
+
+  const partners = await executeKw(
+    "res.partner",
+    "search_read",
+    [domain],
+    { fields: ["id", "name", "vat", "company_id", "customer_rank", "create_date"], limit: 0 }
+  );
+
+  const porClave = new Map();
+  for (const p of partners) {
+    const ruc = (p.vat || "").trim();
+    const nombre = (p.name || "").trim().toUpperCase();
+    if (!ruc || !nombre) continue;
+    const compId = p.company_id ? p.company_id[0] : null;
+    const compNombre = p.company_id ? p.company_id[1] : null;
+    const clave = `${ruc}|||${nombre}|||${compId}`;
+    if (!porClave.has(clave)) porClave.set(clave, { ruc, nombre: p.name, company_id: compId, company_nombre: compNombre, partners: [] });
+    porClave.get(clave).partners.push({
+      odoo_id: p.id,
+      customer_rank: p.customer_rank,
+      fecha_creacion: p.create_date ? p.create_date.slice(0, 10) : null,
+    });
+  }
+
+  return [...porClave.values()]
+    .filter((g) => g.partners.length > 1)
+    .map((g) => ({
+      ...g,
+      // Sugerencia débil, NO una fusión — el partner con más
+      // customer_rank (más historial transaccional en Odoo) suele ser
+      // el "real"/original, pero esto es solo contexto para que un
+      // humano decida, igual que `sugerencia_maestro` en el resto de
+      // la categoría — fusionar contactos de Odoo es una acción fuera
+      // del alcance de esta tool (Fase 1, solo diagnóstico).
+      partner_con_mas_historial: g.partners.reduce((mejor, p) => (p.customer_rank > mejor.customer_rank ? p : mejor)).odoo_id,
+    }))
+    .sort((a, b) => b.partners.reduce((s, p) => s + p.customer_rank, 0) - a.partners.reduce((s, p) => s + p.customer_rank, 0));
 }
 
 async function auditarActivosSinConsumo(companyId, umbralDias, offset, limite, formatoSalida, activoOdooPorRuc) {
