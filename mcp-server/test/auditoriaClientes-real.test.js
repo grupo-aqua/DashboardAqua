@@ -80,9 +80,16 @@ async function main() {
     ) x
   `);
   const resultadoDup = await auditoriaClientes({ categoria: "duplicados", limite: 1 });
+  // FIX 2026-10-14 (reporte real del usuario, caso Chichanda — ver TODO.md):
+  // senal_fuerte ya NO es "todo grupo de mismo RUC+company_id+nombre" — los
+  // grupos donde CADA código tiene su PROPIO contacto en Odoo (vínculo
+  // directo codigo_cliente == id de Odoo) se sacaron a
+  // `mismo_ruc_multiples_contactos_odoo` (no son duplicados de MobilVendor).
+  // La comparación contra el SQL crudo (que mide el universo viejo
+  // completo) ahora es contra la SUMA de ambos campos.
   asegurar(
-    resultadoDup.senal_fuerte.total === Number(fuerteReal[0].n),
-    `duplicados.senal_fuerte: total tool (${resultadoDup.senal_fuerte.total}) == SQL directo (${fuerteReal[0].n})`
+    resultadoDup.senal_fuerte.total + resultadoDup.mismo_ruc_multiples_contactos_odoo.total === Number(fuerteReal[0].n),
+    `duplicados.senal_fuerte + mismo_ruc_multiples_contactos_odoo (${resultadoDup.senal_fuerte.total} + ${resultadoDup.mismo_ruc_multiples_contactos_odoo.total}) == SQL directo del universo completo (${fuerteReal[0].n})`
   );
   // AMPLIACIÓN 2026-10-01: senal_debil ya NO es "mismo RUC, nombres EXACTOS
   // distintos" completo — ese universo se partió en 2 (senal_debil +

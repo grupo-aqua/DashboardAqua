@@ -632,7 +632,61 @@ function porEstadoOdooCodigos(gruposODocs, obtenerCodigos, contexto) {
   return conteo;
 }
 
-async function auditarDuplicados(companyId, offset, limite, formatoSalida, incluirCadenas, activoOdooPorRuc) {
+// ============================================================
+// Vínculo directo codigo_cliente == id de Odoo — investigado 2026-10-14
+// (reporte real del usuario, caso "Chichanda Zambrano Reuberto Marón",
+// ver TODO.md). Cuando un cliente se crea correctamente desde Odoo
+// (`sincronizacionOdooService.js`, rama "cliente no encontrado →
+// crear desde factura"), el `codigo_cliente` local queda IGUAL al `id`
+// del partner de Odoo — confirmado con datos reales (Chichanda:
+// codigo_cliente 112408 == id de Odoo 112408). Un código que NO calza
+// con ningún `id` de Odoo para ese RUC nunca se creó ahí — es un
+// huérfano propio de MobilVendor. A diferencia de `activo_odoo` (que
+// es una propiedad del RUC compartido, no de cada código — ver
+// `clasificarActivoOdoo`), esto SÍ distingue código por código.
+//
+// Verificado a escala contra los 988 grupos de `senal_fuerte`
+// existentes al momento de este fix: 798 (81%) con exactamente un
+// código vinculado (el patrón real a limpiar en MobilVendor), 170
+// (17%) con CADA código vinculado a su PROPIO contacto en Odoo (no es
+// un duplicado de MobilVendor — Odoo mismo tiene varios contactos
+// reales bajo ese RUC, ej. grupos corporativos — se exponen aparte,
+// no se cuentan como "duplicado real"), 6 (0.6%) sin ningún código
+// vinculado, 14 (1.4%) con vínculo parcial en grupos de 3+.
+function clasificarVinculoOdoo(codigos, idsOdoo) {
+  const vinculados = codigos.filter((cod) => idsOdoo.has(cod));
+  if (vinculados.length === 0) return "NINGUNO_VINCULADO";
+  if (vinculados.length === codigos.length) return "TODOS_VINCULADOS";
+  if (vinculados.length === 1) return "UN_SOLO_VINCULADO";
+  return "PARCIAL";
+}
+
+function porClasificacionVinculo(items) {
+  const conteo = { UN_SOLO_VINCULADO: 0, NINGUNO_VINCULADO: 0, PARCIAL: 0 };
+  for (const it of items) conteo[it.clasificacion_vinculo] = (conteo[it.clasificacion_vinculo] || 0) + 1;
+  return conteo;
+}
+
+// Mismo propósito que `detalleCodigos`, pero marca `vinculado_odoo` por
+// código y prioriza como `sugerencia_maestro` al código vinculado a Odoo
+// (si hay uno solo) o al de mayor `ventas_12m` ENTRE los vinculados (si
+// hay 2+, caso PARCIAL) — solo cuando NINGUNO está vinculado cae al
+// criterio anterior (mayor `ventas_12m` de todo el grupo).
+function detalleCodigosConVinculo(codigos, contexto, idsOdoo) {
+  const detalle = codigos
+    .map((cod) => contexto.get(cod))
+    .filter(Boolean)
+    .map((d) => ({ ...d, vinculado_odoo: idsOdoo.has(d.codigo_cliente) }));
+  const vinculados = detalle.filter((d) => d.vinculado_odoo);
+  const candidatos = vinculados.length > 0 ? vinculados : detalle;
+  const sugerenciaMaestro =
+    candidatos.length > 0
+      ? candidatos.reduce((mejor, d) => ((d.ventas_12m || 0) > (mejor.ventas_12m || 0) ? d : mejor)).codigo_cliente
+      : null;
+  return { detalle, sugerencia_maestro: sugerenciaMaestro };
+}
+
+async function auditarDuplicados(companyId, offset, limite, formatoSalida, incluirCadenas, activoOdooPorRuc, idsOdooPorRuc) {
   const [fuerteRes, debilRes, equivRes, telRes, pinRes, nombresProbRes] = await Promise.all([
     pool.query(sqlDuplicadosFuerte(), [companyId || null]),
     pool.query(sqlDuplicadosDebil(), [companyId || null]),
@@ -682,7 +736,32 @@ async function auditarDuplicados(companyId, offset, limite, formatoSalida, inclu
     return codigos.reduce((max, cod) => Math.max(max, contexto.get(cod)?.ventas_12m || 0), 0);
   }
 
-  const senalFuerteItems = fuerteRes.rows
+  // Divide senal_fuerte por vínculo directo con Odoo (ver
+  // `clasificarVinculoOdoo` — reporte real del usuario, caso Chichanda,
+  // 2026-10-14): TODOS_VINCULADOS (cada código tiene su PROPIO contacto
+  // en Odoo) NO es un duplicado de MobilVendor — se saca de senal_fuerte
+  // y se expone aparte, informativo. El resto (UN_SOLO_VINCULADO,
+  // NINGUNO_VINCULADO, PARCIAL) sigue siendo senal_fuerte, ahora con la
+  // clasificación visible por grupo.
+  const fuerteConVinculo = fuerteRes.rows.map((r) => ({
+    ...r,
+    clasificacion_vinculo: clasificarVinculoOdoo(r.codigos, idsOdooPorRuc.get(r.identificacion_cliente) || new Set()),
+  }));
+  const fuerteAccionable = fuerteConVinculo.filter((r) => r.clasificacion_vinculo !== "TODOS_VINCULADOS");
+  const fuerteMultiplesContactos = fuerteConVinculo.filter((r) => r.clasificacion_vinculo === "TODOS_VINCULADOS");
+
+  const senalFuerteItems = fuerteAccionable
+    .map((r) => ({
+      identificacion: r.identificacion_cliente,
+      nombre: r.nombre_cliente,
+      company_id: r.company_id,
+      codigos: r.codigos,
+      clasificacion_vinculo: r.clasificacion_vinculo,
+      ventas_12m_max: ventasMaxGrupo(r.codigos),
+    }))
+    .sort((a, b) => b.ventas_12m_max - a.ventas_12m_max);
+
+  const multiplesContactosItems = fuerteMultiplesContactos
     .map((r) => ({ identificacion: r.identificacion_cliente, nombre: r.nombre_cliente, company_id: r.company_id, codigos: r.codigos, ventas_12m_max: ventasMaxGrupo(r.codigos) }))
     .sort((a, b) => b.ventas_12m_max - a.ventas_12m_max);
 
@@ -708,7 +787,12 @@ async function auditarDuplicados(companyId, offset, limite, formatoSalida, inclu
 
   if (formatoSalida === "resumen_por_tipo") {
     return {
-      senal_fuerte: { total: senalFuerteItems.length, por_estado_odoo: porEstadoOdooCodigos(senalFuerteItems, (i) => i.codigos, contexto) },
+      senal_fuerte: {
+        total: senalFuerteItems.length,
+        por_estado_odoo: porEstadoOdooCodigos(senalFuerteItems, (i) => i.codigos, contexto),
+        por_clasificacion_vinculo: porClasificacionVinculo(senalFuerteItems),
+      },
+      mismo_ruc_multiples_contactos_odoo: { total: multiplesContactosItems.length, por_estado_odoo: porEstadoOdooCodigos(multiplesContactosItems, (i) => i.codigos, contexto) },
       senal_fuerte_normalizada: { total: senalFuerteNormalizadaItems.length, por_estado_odoo: porEstadoOdooCodigos(senalFuerteNormalizadaItems, (i) => i.codigos, contexto) },
       senal_debil: {
         total: debilGenuino.length,
@@ -727,11 +811,31 @@ async function auditarDuplicados(companyId, offset, limite, formatoSalida, inclu
     return { ...pagina, items: pagina.items.map((it) => ({ ...it, ...detalleCodigos(it.codigos, contexto) })) };
   }
 
+  // Variante de `conDetalle` para senal_fuerte: usa `detalleCodigosConVinculo`
+  // (marca `vinculado_odoo` por código, prioriza el código vinculado como
+  // `sugerencia_maestro`) en vez de `detalleCodigos`.
+  function conDetalleVinculo(items, totalReal) {
+    const pagina = paginar(items, offset, limite, totalReal);
+    return {
+      ...pagina,
+      items: pagina.items.map((it) => ({
+        ...it,
+        ...detalleCodigosConVinculo(it.codigos, contexto, idsOdooPorRuc.get(it.identificacion) || new Set()),
+      })),
+    };
+  }
+
   return {
     senal_fuerte: {
-      descripcion: "Mismo RUC+company_id+nombre EXACTO en 2+ codigo_cliente — duplicado real de maestro.",
+      descripcion: "Mismo RUC+company_id+nombre EXACTO en 2+ codigo_cliente, Y NO todos vinculados cada uno a su propio contacto en Odoo (ver `mismo_ruc_multiples_contactos_odoo` para esos) — duplicado real de MobilVendor. `clasificacion_vinculo` por grupo: UN_SOLO_VINCULADO (un código es el real en Odoo, el resto son huérfanos de MobilVendor — el caso más común y más accionable), NINGUNO_VINCULADO (ningún código vinculado a Odoo para este RUC) o PARCIAL (en grupos de 3+, algunos vinculados y otros no). `sugerencia_maestro` prioriza el código vinculado a Odoo cuando existe.",
       por_estado_odoo: porEstadoOdooCodigos(senalFuerteItems, (i) => i.codigos, contexto),
-      ...conDetalle(senalFuerteItems),
+      por_clasificacion_vinculo: porClasificacionVinculo(senalFuerteItems),
+      ...conDetalleVinculo(senalFuerteItems),
+    },
+    mismo_ruc_multiples_contactos_odoo: {
+      descripcion: "Mismo RUC+company_id+nombre EXACTO en 2+ codigo_cliente, pero CADA código tiene su PROPIO contacto distinto en Odoo — NO es un duplicado de MobilVendor, es que Odoo mismo tiene varios contactos reales bajo este RUC (ej. grupos corporativos). Informativo, no requiere limpieza en MobilVendor.",
+      por_estado_odoo: porEstadoOdooCodigos(multiplesContactosItems, (i) => i.codigos, contexto),
+      ...conDetalle(multiplesContactosItems),
     },
     senal_fuerte_normalizada: {
       descripcion: "Mismo RUC, nombres EXACTOS distintos pero IDÉNTICOS tras normalizar (mayúsculas, sin tildes/puntuación, sin sufijo societario) — ej. 'S.A' vs 'S.A.'. Tan confiable como senal_fuerte.",
@@ -825,14 +929,19 @@ function sqlClientesConRuc() {
   `;
 }
 
-async function fetchOdooActivoPorRuc() {
+// Trae de Odoo, en UNA sola consulta, tanto el estado activo/archivado
+// por RUC (como antes) como el set de `id` de Odoo por RUC (nuevo,
+// 2026-10-14 — ver `clasificarVinculoOdoo` arriba). Un solo round-trip,
+// mismo filtro de siempre.
+async function fetchOdooPorRuc() {
   const partners = await executeKw(
     "res.partner",
     "search_read",
     [[["customer_rank", ">", 0], ["vat", "!=", false]]],
-    { fields: ["vat", "active"], context: { active_test: false }, limit: 0 }
+    { fields: ["id", "vat", "active"], context: { active_test: false }, limit: 0 }
   );
-  const map = new Map();
+  const activoPorRuc = new Map();
+  const idsPorRuc = new Map();
   for (const p of partners) {
     const ruc = (p.vat || "").trim();
     if (!ruc) continue;
@@ -840,9 +949,11 @@ async function fetchOdooActivoPorRuc() {
     // (raro pero posible), basta con que UNO esté activo para considerar
     // "activo en Odoo" — es una señal de "¿existe todavía en algún lado
     // como activo?", no de unicidad de partner.
-    map.set(ruc, map.get(ruc) || p.active);
+    activoPorRuc.set(ruc, activoPorRuc.get(ruc) || p.active);
+    if (!idsPorRuc.has(ruc)) idsPorRuc.set(ruc, new Set());
+    idsPorRuc.get(ruc).add(String(p.id));
   }
-  return map;
+  return { activoPorRuc, idsPorRuc };
 }
 
 async function auditarActivosSinConsumo(companyId, umbralDias, offset, limite, formatoSalida, activoOdooPorRuc) {
@@ -906,16 +1017,17 @@ async function auditoriaClientes({
     return { companias: await listarCompanias() };
   }
 
-  // `activoOdooPorRuc` se trae UNA sola vez por llamada (ver comentario
-  // grande sobre el reporte de Kenny Navas, 2026-10-01) y se reutiliza en
-  // las 5 categorías — antes solo `activos_sin_consumo` la pedía.
-  const activoOdooPorRuc = await fetchOdooActivoPorRuc();
+  // `activoOdooPorRuc`/`idsOdooPorRuc` se traen UNA sola vez por llamada
+  // (ver comentario grande sobre el reporte de Kenny Navas, 2026-10-01) y
+  // se reutilizan en las 5 categorías — `idsOdooPorRuc` (vínculo directo
+  // codigo_cliente == id de Odoo) solo la usa `duplicados`.
+  const { activoPorRuc: activoOdooPorRuc, idsPorRuc: idsOdooPorRuc } = await fetchOdooPorRuc();
 
   if (categoria) {
     let resultado;
     if (categoria === "direcciones_incompletas") resultado = await auditarDireccionesIncompletas(company_id, offset, limite, formato_salida, activoOdooPorRuc);
     else if (categoria === "coordenadas") resultado = await auditarCoordenadas(company_id, tipo_problema, offset, limite, formato_salida, solo_activos_dias, activoOdooPorRuc);
-    else if (categoria === "duplicados") resultado = await auditarDuplicados(company_id, offset, limite, formato_salida, incluir_cadenas, activoOdooPorRuc);
+    else if (categoria === "duplicados") resultado = await auditarDuplicados(company_id, offset, limite, formato_salida, incluir_cadenas, activoOdooPorRuc, idsOdooPorRuc);
     else if (categoria === "sin_canal") resultado = await auditarSinCanal(company_id, offset, limite, formato_salida, activoOdooPorRuc);
     else if (categoria === "activos_sin_consumo") resultado = await auditarActivosSinConsumo(company_id, umbral_dias_inactividad, offset, limite, formato_salida, activoOdooPorRuc);
     return { categoria, company_id: company_id || null, ...resultado };
@@ -927,7 +1039,7 @@ async function auditoriaClientes({
   const [direcciones, coordenadas, duplicados, sinCanal, activosSinConsumo] = await Promise.all([
     auditarDireccionesIncompletas(company_id, 0, MUESTRA_RESUMEN, "json", activoOdooPorRuc),
     auditarCoordenadas(company_id, tipo_problema, 0, MUESTRA_RESUMEN, "json", solo_activos_dias, activoOdooPorRuc),
-    auditarDuplicados(company_id, 0, MUESTRA_RESUMEN, "json", incluir_cadenas, activoOdooPorRuc),
+    auditarDuplicados(company_id, 0, MUESTRA_RESUMEN, "json", incluir_cadenas, activoOdooPorRuc, idsOdooPorRuc),
     auditarSinCanal(company_id, 0, MUESTRA_RESUMEN, "json", activoOdooPorRuc),
     auditarActivosSinConsumo(company_id, umbral_dias_inactividad, 0, MUESTRA_RESUMEN, "json", activoOdooPorRuc),
   ]);
