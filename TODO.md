@@ -6324,3 +6324,90 @@ facturas f` en cada archivo (ninguno quedó sin el filtro).
   directamente).
 - PR abierto, **sin mergear ni desplegar** — pendiente de autorización
   aparte.
+
+## 🔍 Revisión: `auditoriaClientes` categoría `duplicados` — "ACTIVO en Odoo" confunde, pero el caso puntual SÍ es un duplicado real (2026-10-14, SOLO INVESTIGACIÓN, sin implementar)
+
+Reporte del usuario: el chatbot le mostró un caso (Chichanda Zambrano
+Reuberto Marón, RUC `1304562737001`, `codigo_cliente` 112408 y 226828)
+como `senal_fuerte` ("duplicado real de maestro"), con ambos códigos
+marcados `ACTIVO` en Odoo — y luego el propio chatbot tuvo que corregirse:
+"ACTIVO" no significa que cada código tenga su propio contacto en Odoo,
+solo que el RUC compartido está activo en algún lado.
+
+### Confirmado con datos reales — el mecanismo que describió el chatbot es exacto
+
+`fetchOdooActivoPorRuc()` (auditoriaClientes.js:828) trae un Map
+`ruc -> activo` desde Odoo, UN valor por RUC — documentado ya en el
+propio código ("si el mismo RUC aparece en más de un partner con
+estados distintos, basta con que UNO esté activo... es una señal de
+¿existe todavía activo en algún lado?, NO de unicidad de partner").
+`clasificarActivoOdoo(ruc, ...)` se aplica luego POR CÓDIGO dentro de
+un grupo duplicado — así que los 2 códigos de un mismo RUC SIEMPRE
+salen con el mismo `activo_odoo`, sin importar si cada uno representa
+algo real o no. La descripción actual de `senal_fuerte`
+("duplicado real de maestro") no deja claro este matiz — es la causa
+raíz de la confusión, no un error de cálculo.
+
+### Pero el caso puntual de Chichanda SÍ es un duplicado real que amerita revisión — verificado con el historial completo
+
+```
+112408: 264 órdenes (2025-09-15 → 2026-10-13, HOY — cuenta viva, en uso activo)
+226828:   8 órdenes (2025-09-16 → 2025-09-25, ventana de 9 días, nada desde entonces)
+```
+
+226828 tiene coordenadas/dirección genéricas ("GUAYAQUIL", sin calle),
+112408 tiene dirección y coordenadas reales específicas. Lectura más
+probable: 226828 fue un código creado por error (o una prueba de
+onboarding) hace más de un año, usado brevemente, y abandonado en
+favor de 112408, que es la cuenta real. **Esto es exactamente el tipo
+de caso que `senal_fuerte` debería seguir señalando** — el problema no
+es que esté mal detectado, es que la tool no comunica la diferencia
+entre "ambos códigos con actividad real" (urgente, puede estar
+duplicando ventas) y "un código vivo + uno abandonado hace tiempo"
+(de menor urgencia, aunque igual conviene archivarlo).
+
+### A escala — el patrón de Chichanda no es un caso aislado, es el 16% de los 988
+
+Usando `ventas_12m` (el mismo campo que la tool YA calcula por código,
+`SQL_VENTAS_12M`) para clasificar los 988 grupos de `senal_fuerte`:
+
+```sql
+multiple_con_actividad (2+ códigos con ventas en 12m) : 538  (54%)
+un_solo_activo (exactamente 1 código con ventas, resto en 0) : 160  (16%) ← el patrón Chichanda
+ninguno_con_actividad_12m (ambos/todos dormidos)      : 290  (29%)
+```
+
+Casi la mitad (45%, 450 de 988) tiene A LO SUMO un código con actividad
+real en el último año — no representan un riesgo de doble conteo de
+ventas HOY (que es la preocupación central del usuario: "no debería
+contarme doble un cliente... que fue sincronizado a MobilVendor"), aunque
+sí siguen siendo basura de maestro que conviene limpiar en algún momento.
+
+### Propuesta (sin implementar, pendiente de confirmación del usuario)
+
+1. **Agregar una clasificación por actividad a `senal_fuerte` (y
+   `senal_fuerte_normalizada`, mismo patrón)**: por grupo,
+   `clasificacion_actividad` = `AMBOS_ACTIVOS` (2+ códigos con
+   `ventas_12m>0`) / `UNO_ACTIVO` (exactamente 1) / `NINGUNO_ACTIVO_12M`
+   (0) — reutiliza `ventas_12m`, ya calculado, sin sync ni cálculo
+   nuevo. Más un resumen `por_clasificacion_actividad` (conteo de
+   grupos en cada balde), igual patrón que `por_estado_odoo` ya
+   existente.
+2. **Corregir la descripción/semántica de `activo_odoo`** para dejar
+   explícito que es una propiedad del RUC compartido, no de cada
+   código individualmente — evita que se vuelva a interpretar como
+   "ambos códigos confirmados independientes en Odoo".
+3. **No se propone excluir nada del conteo** — `senal_fuerte` sigue
+   siendo el universo completo de 988 (sigue siendo información real
+   de calidad de datos), solo se agrega la clasificación para que el
+   usuario pueda priorizar/filtrar él mismo (ej. empezar por los 538
+   "ambos activos", que son los que de verdad arriesgan doble conteo
+   de ventas en reportes).
+
+### Pendiente
+
+Confirmación del usuario sobre el diseño exacto (¿el campo nuevo
+alcanza, o además quiere poder filtrar `senal_fuerte` por
+`clasificacion_actividad` como parámetro, igual que ya existe
+`company_id`/`solo_activos_dias`?) antes de implementar. No se tocó
+código todavía.
