@@ -6406,8 +6406,74 @@ sí siguen siendo basura de maestro que conviene limpiar en algún momento.
 
 ### Pendiente
 
-Confirmación del usuario sobre el diseño exacto (¿el campo nuevo
-alcanza, o además quiere poder filtrar `senal_fuerte` por
-`clasificacion_actividad` como parámetro, igual que ya existe
-`company_id`/`solo_activos_dias`?) antes de implementar. No se tocó
-código todavía.
+~~Confirmación del usuario sobre el diseño exacto...~~ → **Implementado,
+con un diseño MEJOR que la propuesta original de `clasificacion_actividad`
+(ventas_12m)** — ver la sección siguiente.
+
+## ✅ Implementado — `clasificacion_vinculo` (vínculo directo con Odoo, no heurística de actividad) (2026-10-14)
+
+Durante la conversación de seguimiento con el usuario (quiso verificar el
+caso Chichanda él mismo en Odoo, y ahí preguntó "¿dónde está el otro
+código?") salió un dato mejor que `ventas_12m`: cuando Odoo crea un
+cliente, el `codigo_cliente` local queda IGUAL al `id` del partner de
+Odoo (confirmado: Chichanda 112408 == id de Odoo 112408). Esto da una
+señal DETERMINÍSTICA (no una heurística de actividad reciente, que
+podría fallar con un cliente real pero pausado) para saber exactamente
+qué código, dentro de un grupo de `senal_fuerte`, es el vinculado a
+Odoo.
+
+**Validado a escala, con el filtro correcto** (`customer_rank>0`, el
+MISMO que ya usa `fetchOdooActivoPorRuc` — una corrida inicial sin ese
+filtro, solo de prueba, había dado números distintos y menos precisos):
+
+```
+senal_fuerte (accionable, total)      : 897
+  UN_SOLO_VINCULADO (patrón Chichanda): 828
+  NINGUNO_VINCULADO                   :  51
+  PARCIAL (grupos de 3+)              :  18
+mismo_ruc_multiples_contactos_odoo    :  91  (sacado de senal_fuerte — NO es duplicado de MobilVendor)
+```
+
+### Cambios
+
+- `fetchOdooActivoPorRuc()` → `fetchOdooPorRuc()`: mismo único round-trip
+  a Odoo, ahora también trae `id` y arma `idsPorRuc` (Map ruc → Set de
+  ids) además del `activoPorRuc` de siempre.
+- `clasificarVinculoOdoo(codigos, idsOdoo)`: UN_SOLO_VINCULADO /
+  TODOS_VINCULADOS / NINGUNO_VINCULADO / PARCIAL.
+- `senal_fuerte` ahora excluye los grupos `TODOS_VINCULADOS` (se sacan a
+  `mismo_ruc_multiples_contactos_odoo`, campo nuevo, informativo) — trae
+  `clasificacion_vinculo` por grupo y `por_clasificacion_vinculo` en el
+  resumen. `sugerencia_maestro` ahora prioriza el código vinculado a
+  Odoo (antes era solo por `ventas_12m` — sigue siendo el criterio de
+  desempate entre vinculados, o el fallback cuando ninguno lo está).
+- Detalle por código trae `vinculado_odoo: true/false` nuevo.
+- Descripción de la tool en `server.js` actualizada para explicar la
+  diferencia entre `activo_odoo` (propiedad del RUC compartido) y
+  `clasificacion_vinculo`/`vinculado_odoo` (propiedad de cada código) —
+  directamente para que el chatbot no vuelva a explicarlo mal como pasó
+  con Chichanda.
+- `senal_debil`, `senal_fuerte_normalizada`, `equivalencia_cedula_ruc`,
+  `mismo_telefono`, `mismo_pin`, `nombres_problematicos`: sin cambios,
+  fuera de alcance (el usuario preguntó puntualmente por `senal_fuerte`).
+
+### Validación
+
+`node --check` OK en los 5 archivos tocados. Suite completa:
+`test:seguridad`, `test:oauth`, `test:auditoria-clientes-real` (1
+aserción actualizada: la comparación contra SQL crudo ahora es contra
+`senal_fuerte.total + mismo_ruc_multiples_contactos_odoo.total`, mismo
+patrón ya usado para la partición senal_debil/senal_fuerte_normalizada),
+`test:auditoria-clientes-ampliacion-real`,
+`test:auditoria-clientes-estado-odoo-real` — todos OK, sin regresión.
+Nuevo `test:auditoria-clientes-vinculo-odoo-real` (11 aserciones,
+valida el caso real completo de Chichanda: `UN_SOLO_VINCULADO`,
+`vinculado_odoo` correcto en ambos códigos, `sugerencia_maestro`
+apuntando al código real, 0 `TODOS_VINCULADOS` dentro de `senal_fuerte`,
+`mismo_ruc_multiples_contactos_odoo` con casos reales, sumas exactas
+JSON↔resumen_por_tipo) en verde.
+
+### Estado
+
+PR nuevo (`fix/duplicados-vinculo-odoo`), **sin mergear ni desplegar**
+— pendiente de autorización.
