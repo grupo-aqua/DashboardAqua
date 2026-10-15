@@ -6551,5 +6551,80 @@ campo nuevo, sumas exactas JSON↔resumen_por_tipo.
 
 ### Estado
 
-PR nuevo (`fix/duplicados-reales-odoo`), **sin mergear ni desplegar**
-— pendiente de autorización.
+~~PR nuevo..., sin mergear ni desplegar~~ → **mergeado (PR #15) y
+desplegado a producción, verificado en vivo** (commit `5b4dcac`,
+`/health` + `duplicados_en_odoo.total=51` confirmado contra el server
+real).
+
+## ✅ Implementado — 2 tools nuevas: `direccionesEntregaDuplicadas` y `auditoriaProveedores` (2026-10-15)
+
+Pedido explícito del usuario, seguimiento directo de la investigación
+de `duplicados_en_odoo`: (1) direcciones de entrega duplicadas en Odoo
+(`res.partner`, `type='delivery'`) por nombre o calle, para exportar y
+revisar; (2) lo mismo que `auditoriaClientes` pero para PROVEEDORES —
+duplicados + sin movimiento, "para ya limpiar toda la base".
+
+### `direccionesEntregaDuplicadas` — bug real encontrado y corregido ANTES de entregar
+
+Diseño inicial (acordado con el usuario): una sola señal unificada,
+agrupando TRANSITIVAMENTE (union-find) direcciones del mismo
+`parent_id` que comparten nombre EXACTO o calle EXACTA. **Validando en
+vivo, antes de entregar, apareció un problema real**: cadenas grandes
+(CORPORACION EL ROSADO S.A., CRESA-RETAIL, ATIMASA, CONECEL) registran
+decenas/cientos de locales reales bajo la MISMA calle de matriz/
+facturación — agrupar solo por calle ahí fusionaba locales genuinamente
+distintos en un solo "grupo duplicado" gigante (El Rosado: 1 grupo de
+**166 direcciones con 108 nombres DISTINTOS** — puro ruido, mismo
+patrón que las "cadenas grandes" ya conocido en
+`auditoriaClientes.senal_debil`).
+
+**Fix**: `UMBRAL_CADENA_GRANDE_DIRECCIONES = 8` — la unión por NOMBRE
+exacto sigue aplicando siempre (segura, sin importar el tamaño del
+padre); la unión por CALLE exacta solo se activa cuando el padre tiene
+8 direcciones de entrega o menos. Resultado tras el fix: El Rosado pasa
+de 1 grupo de 166 a **26 grupos chicos y limpios**, cada uno con el
+MISMO nombre repetido (ej. "COMISARIATO ALBORADA" ×5) — los duplicados
+reales siguen detectados, el ruido desaparece. Total de la tool:
+271 → **216** grupos tras el fix; `cadenas_grandes_sin_match_por_calle`
+(56) cuenta cuántos padres grandes quedaron limitados a solo nombre,
+para que quede documentado, no oculto.
+
+### `auditoriaProveedores` — base de proveedores mucho más chica y más limpia que la de clientes
+
+```
+Total proveedores activos (supplier_rank>0): 2,044
+duplicados (mismo RUC+nombre+company_id, ambos activos): 2 grupos
+sin_movimiento (sin factura posted en >180 días, default): 1,491 candidatos
+```
+Mismo criterio de duplicados ya validado en `duplicados_en_odoo`
+(exige `company_id` — una misma persona/RUC puede ser proveedor real de
+más de una compañía del grupo). `sin_movimiento` calcula la última
+factura de proveedor (`account.move`, in_invoice/in_refund, posted) por
+partner en una sola consulta liviana (31,174 facturas, solo
+partner_id+invoice_date) — mismo patrón que
+`auditoriaClientes.auditarActivosSinConsumo`.
+
+**Bug real encontrado y corregido ANTES de entregar**: la primera
+versión prometía `partner_con_mas_historial` en la descripción pero
+nunca lo calculaba (copy-paste incompleto del patrón de
+`duplicados_en_odoo`, que usa `customer_rank` — no aplica a
+proveedores). Corregido: usa la `fecha_creacion` MÁS ANTIGUA entre los
+partners del grupo como aproximación de "el registro original".
+
+### Validación
+
+`node --check` OK en los 6 archivos tocados/nuevos. Suite completa
+(`seguridad`, `oauth` — actualizado de 17 a 19 tools registradas,
+`auditoria-clientes-real`, `-ampliacion-real`, `-estado-odoo-real`,
+`-vinculo-odoo-real`, `-duplicados-odoo-real`) sin regresión. 2 tests
+nuevos dedicados: `direccionesEntregaDuplicadas-real.test.js` (confirma
+que ningún grupo supera un tamaño razonable, que El Rosado quedó en
+grupos chicos de un solo nombre repetido, paginación/company_id/
+resumen_por_tipo consistentes) y `auditoriaProveedores-real.test.js`
+(valida los 2 duplicados reales conocidos, `partner_con_mas_historial`
+correcto, `sin_movimiento` con candidatos reales, company_id filtra).
+
+### Estado
+
+PR nuevo (`feature/direcciones-entrega-y-auditoria-proveedores`),
+**sin mergear ni desplegar** — pendiente de autorización.
