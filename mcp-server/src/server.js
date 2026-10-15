@@ -37,6 +37,8 @@ const { backlogPrevendedores, inputSchema: schemaBacklogPrevendedores } = requir
 const { ventasRutaOk, inputSchema: schemaVentasRutaOk } = require("./tools/ventasRutaOk");
 const { facturasProveedores, inputSchema: schemaFacturasProveedores } = require("./tools/facturasProveedores");
 const { auditoriaClientes, inputSchema: schemaAuditoriaClientes } = require("./tools/auditoriaClientes");
+const { direccionesEntregaDuplicadas, inputSchema: schemaDireccionesEntregaDuplicadas } = require("./tools/direccionesEntregaDuplicadas");
+const { auditoriaProveedores, inputSchema: schemaAuditoriaProveedores } = require("./tools/auditoriaProveedores");
 
 function resultadoTexto(objeto) {
   return { content: [{ type: "text", text: JSON.stringify(objeto, null, 2) }] };
@@ -213,6 +215,26 @@ function crearServer() {
       inputSchema: schemaAuditoriaClientes,
     },
     async (args) => resultadoTexto(await auditoriaClientes(args))
+  );
+
+  server.registerTool(
+    "direccionesEntregaDuplicadas",
+    {
+      description:
+        "FASE 1, SOLO DIAGNÓSTICO — direcciones de entrega (res.partner, type='delivery', active=true) duplicadas dentro del MISMO cliente padre (parent_id). Corre directo contra Odoo, NO depende de MobilVendor. Se agrupan TRANSITIVAMENTE (union-find) las que comparten nombre EXACTO o calle EXACTA, normalizados (mayúsculas, sin tildes, sin espacios al borde) — una sola señal unificada, no dos separadas. Caso típico real: la misma tienda/local cargada 2+ veces, a veces una con coordenadas reales y otra en (0,0). `company_id` (opcional) filtra por compañía de Odoo. Cada grupo trae `padre_id`/`padre_nombre` y `direcciones` (id, nombre, calle, calle2, ciudad, latitud, longitud de cada una). `formato_salida='resumen_por_tipo'` da solo el total. Nunca fusiona ni borra nada — requiere revisión humana en Odoo.",
+      inputSchema: schemaDireccionesEntregaDuplicadas,
+    },
+    async (args) => resultadoTexto(await direccionesEntregaDuplicadas(args))
+  );
+
+  server.registerTool(
+    "auditoriaProveedores",
+    {
+      description:
+        "FASE 1, SOLO DIAGNÓSTICO — mismo espíritu que auditoriaClientes (duplicados_en_odoo/activos_sin_consumo) pero para PROVEEDORES (res.partner, supplier_rank>0). Corre directo contra Odoo, los proveedores no existen en MobilVendor. Sin `categoria`: resumen de las 2 categorías con muestra chica (5) de cada una. Con `categoria` ('duplicados'|'sin_movimiento'): listado completo hasta `limite` (default 50, tope 500) desde `offset`. `company_id` (opcional) filtra por compañía de Odoo. `duplicados`: mismo RUC/cédula + mismo nombre EXACTO + MISMA company_id, 2+ partners con supplier_rank>0 y active=true — MISMO criterio ya validado en auditoriaClientes.duplicados_en_odoo (exige company_id porque una misma persona/RUC puede ser proveedor real de más de una compañía del grupo); `partner_con_mas_historial` es sugerencia débil, nunca fusiona nada. `sin_movimiento`: proveedores activos sin ninguna factura de proveedor posted (account.move, in_invoice/in_refund) en más de `umbral_dias_inactividad` días (default 180) o que nunca tuvieron una — candidatos a archivar, requiere revisión humana, nunca se archiva/borra automático.",
+      inputSchema: schemaAuditoriaProveedores,
+    },
+    async (args) => resultadoTexto(await auditoriaProveedores(args))
   );
 
   return server;

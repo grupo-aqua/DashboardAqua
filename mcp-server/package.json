@@ -26,6 +26,8 @@
     "test:auditoria-clientes-estado-odoo-real": "node test/auditoriaClientesEstadoOdoo-real.test.js",
     "test:auditoria-clientes-vinculo-odoo-real": "node test/auditoriaClientesVinculoOdoo-real.test.js",
     "test:auditoria-clientes-duplicados-odoo-real": "node test/auditoriaClientesDuplicadosOdoo-real.test.js",
+    "test:direcciones-entrega-duplicadas-real": "node test/direccionesEntregaDuplicadas-real.test.js",
+    "test:auditoria-proveedores-real": "node test/auditoriaProveedores-real.test.js",
     "test:ventas-cliente-facturas-duplicadas-real": "node test/ventasClienteFacturasDuplicadas-real.test.js"
   },
   "dependencies": {
